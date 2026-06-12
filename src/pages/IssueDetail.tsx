@@ -1,16 +1,16 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/store';
-import { IssueStatus, Issue, ReviewPlan, PlanConflict, PlanAttachment, UserRole } from '@/types';
-import { hasPermission, canManageIssue, canCreatePlan, canEditPlan, canResolvePlanConflict, canViewPlan, canExportHandover } from '@/utils/permissions';
-import { IssueStatusBadge, PriorityBadge } from '@/components/StatusBadge';
+import { IssueStatus, Issue, ReviewPlan, PlanConflict, PlanAttachment, UserRole, PlanDelayRecord } from '@/types';
+import { hasPermission, canManageIssue, canCreatePlan, canEditPlan, canResolvePlanConflict, canViewPlan, canExportHandover, canRequestDelay, canApproveDelay, canResolveTimeConflict, canDirectlyChangeReviewTime } from '@/utils/permissions';
+import { IssueStatusBadge, PriorityBadge, DueStatusBadge } from '@/components/StatusBadge';
 import { formatDate, ACTION_LABELS, getRoleName, PLAN_SYNC_STATUS_LABELS, PLAN_SYNC_STATUS_COLORS } from '@/utils/helpers';
 import {
   ArrowLeft, Store, Calendar, User, FileText, CloudOff, Cloud, AlertTriangle,
   CheckCircle, XCircle, Edit3, Image as ImageIcon, MessageSquare, AlertCircle,
   History as HistoryIcon, GitBranch, Shield, RefreshCw, ArrowRight, Plus,
   ClipboardCheck, Trash2, Save, X, File, ChevronDown, ChevronUp, Download,
-  Package
+  Package, Hourglass
 } from 'lucide-react';
 import { diffReviewPlans } from '@/services/syncService';
 import { generateId } from '@/utils/helpers';
@@ -25,6 +25,7 @@ export default function IssueDetail() {
     updateIssueStatus, resolveConflict, addToast, getTemplateForIssue,
     createReviewPlan, updateReviewPlan, deleteReviewPlan, resolvePlanConflict,
     getReviewPlansForIssue, exportHandover,
+    requestPlanDelay, approvePlanDelay, rejectPlanDelay, resolvePlanTimeConflict,
   } = useAppStore();
 
   const [showConflict, setShowConflict] = useState(false);
@@ -40,6 +41,17 @@ export default function IssueDetail() {
     rectificationNote: '',
   });
   const [showPlanConflict, setShowPlanConflict] = useState<string | null>(null);
+  const [showDelayForm, setShowDelayForm] = useState<string | null>(null);
+  const [delayForm, setDelayForm] = useState({
+    reason: '',
+    newReviewTime: '',
+    attachmentSummary: '',
+  });
+  const [showApproveForm, setShowApproveForm] = useState<PlanDelayRecord | null>(null);
+  const [showRejectDelayForm, setShowRejectDelayForm] = useState<PlanDelayRecord | null>(null);
+  const [approveRemark, setApproveRemark] = useState('');
+  const [rejectDelayRemark, setRejectDelayRemark] = useState('');
+  const [showTimeConflictResolve, setShowTimeConflictResolve] = useState<string | null>(null);
 
   const issue = issues.find(i => i.id === id);
   const store = stores.find(s => s.id === issue?.storeId);
@@ -132,6 +144,63 @@ export default function IssueDetail() {
   const handleResolvePlanConflict = async (pcId: string, resolution: 'local' | 'remote' | 'merge') => {
     await resolvePlanConflict(pcId, resolution);
     setShowPlanConflict(null);
+  };
+
+  const openDelayForm = (plan: ReviewPlan) => {
+    if (!canRequestDelay(currentUser, plan, issue)) {
+      addToast('error', '无权为该计划申请延期');
+      return;
+    }
+    if (!canDirectlyChangeReviewTime(currentUser, plan, issue)) {
+      addToast('info', '您无法直接修改复查时间，请通过延期申请流程');
+    }
+    setShowDelayForm(plan.id);
+    setDelayForm({
+      reason: '',
+      newReviewTime: new Date(new Date(plan.reviewTime).getTime() + 7 * 86400000).toISOString().slice(0, 16),
+      attachmentSummary: '',
+    });
+  };
+
+  const handleSubmitDelay = async (planId: string) => {
+    const res = await requestPlanDelay(planId, delayForm);
+    if (res.success) {
+      setShowDelayForm(null);
+      setDelayForm({ reason: '', newReviewTime: '', attachmentSummary: '' });
+    } else if (res.error) {
+      addToast('error', res.error);
+    }
+  };
+
+  const handleApproveDelay = async () => {
+    if (!showApproveForm) return;
+    const res = await approvePlanDelay(showApproveForm.id, approveRemark || undefined);
+    if (res.success) {
+      setShowApproveForm(null);
+      setApproveRemark('');
+    } else if (res.error) {
+      addToast('error', res.error);
+    }
+  };
+
+  const handleRejectDelay = async () => {
+    if (!showRejectDelayForm) return;
+    const res = await rejectPlanDelay(showRejectDelayForm.id, rejectDelayRemark || undefined);
+    if (res.success) {
+      setShowRejectDelayForm(null);
+      setRejectDelayRemark('');
+    } else if (res.error) {
+      addToast('error', res.error);
+    }
+  };
+
+  const handleResolveTimeConflict = async (planId: string, resolution: 'local' | 'remote' | 'merge') => {
+    const res = await resolvePlanTimeConflict(planId, resolution);
+    if (res.success) {
+      setShowTimeConflictResolve(null);
+    } else if (res.error) {
+      addToast('error', res.error);
+    }
   };
 
   const isCurrentTemplateLatest = useMemo(() => {
@@ -676,13 +745,106 @@ export default function IssueDetail() {
           ) : (
             <div className="space-y-4">
               {visiblePlans.map(plan => {
-                const canEdit = canEditPlan(currentUser, plan, issue);
+                const canEditP = canEditPlan(currentUser, plan, issue);
+                const canRequestDelayP = canRequestDelay(currentUser, plan, issue);
+                const canApproveDelayP = canApproveDelay(currentUser, plan, issue);
+                const canResolveTC = canResolveTimeConflict(currentUser, plan, issue);
                 const hasConflict = issuePlanConflicts.some(pc => pc.planId === plan.id);
+                const pending = plan.pendingDelayRequest;
+                const approvedRecords = plan.delayRecords?.filter(r => r.status === 'approved') || [];
                 return (
                   <div key={plan.id} className={cn(
                     'border rounded-lg p-4 transition-colors',
-                    hasConflict ? 'border-red-200 bg-red-50/40' : 'border-gray-200'
+                    hasConflict ? 'border-red-200 bg-red-50/40' :
+                    plan.hasTimeConflict ? 'border-orange-200 bg-orange-50/30' :
+                    'border-gray-200'
                   )}>
+                    {plan.hasTimeConflict && plan.timeConflictInfo && (
+                      <div className="mb-3 -mx-4 -mt-4 mb-4 border-b border-orange-200 bg-orange-50 px-4 py-3 rounded-t-lg">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2">
+                            <AlertTriangle className="text-orange-600 mt-0.5 flex-shrink-0" size={18} />
+                            <div>
+                              <p className="font-medium text-orange-800 text-sm">时间冲突</p>
+                              <p className="text-xs text-orange-600 mt-0.5">
+                                本地：{formatDate(plan.timeConflictInfo.localReviewTime)} ·
+                                远端：{formatDate(plan.timeConflictInfo.remoteReviewTime)}
+                              </p>
+                            </div>
+                          </div>
+                          {canResolveTC ? (
+                            <div className="flex gap-2 flex-shrink-0">
+                              {showTimeConflictResolve === plan.id ? (
+                                <>
+                                  <button onClick={() => handleResolveTimeConflict(plan.id, 'local')}
+                                    className="text-xs px-2.5 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">保留本地</button>
+                                  <button onClick={() => handleResolveTimeConflict(plan.id, 'remote')}
+                                    className="text-xs px-2.5 py-1 bg-orange-600 text-white rounded hover:bg-orange-700">采用远端</button>
+                                  <button onClick={() => handleResolveTimeConflict(plan.id, 'merge')}
+                                    className="text-xs px-2.5 py-1 bg-[#1e3a5f] text-white rounded hover:bg-[#2d4a6f]">合并备注</button>
+                                </>
+                              ) : (
+                                <button onClick={() => setShowTimeConflictResolve(
+                                  showTimeConflictResolve === plan.id ? null : plan.id
+                                )}
+                                  className="text-xs px-3 py-1 bg-orange-600 text-white rounded hover:bg-orange-700 flex items-center gap-1">
+                                  处理冲突 <ChevronDown size={12} />
+                                </button>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-xs text-orange-700">请联系督导处理</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {pending && canApproveDelayP && (
+                      <div className="mb-3 -mx-4 -mt-4 mb-4 border-b border-purple-200 bg-purple-50 px-4 py-3 rounded-t-lg">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2">
+                            <Hourglass className="text-purple-600 mt-0.5 flex-shrink-0" size={18} />
+                            <div>
+                              <p className="font-medium text-purple-800 text-sm">
+                                {pending.requesterName}（{getRoleName(pending.requesterRole)}）申请延期
+                              </p>
+                              <p className="text-xs text-purple-600 mt-0.5">
+                                原因：{pending.reason}
+                              </p>
+                              <p className="text-xs text-purple-500 mt-0.5">
+                                原 {formatDate(pending.oldReviewTime)} → 新 {formatDate(pending.newReviewTime)}
+                                {pending.attachmentSummary && ` · 附件摘要：${pending.attachmentSummary}`}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex gap-2 flex-shrink-0">
+                            <button
+                              onClick={() => { setShowApproveForm(pending); setApproveRemark(''); }}
+                              className="text-xs px-3 py-1.5 bg-green-600 text-white rounded hover:bg-green-700"
+                            >批准</button>
+                            <button
+                              onClick={() => { setShowRejectDelayForm(pending); setRejectDelayRemark(''); }}
+                              className="text-xs px-3 py-1.5 bg-red-600 text-white rounded hover:bg-red-700"
+                            >驳回</button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {pending && !canApproveDelayP && (
+                      <div className="mb-3 -mx-4 -mt-4 mb-4 border-b border-purple-200 bg-purple-50 px-4 py-3 rounded-t-lg">
+                        <div className="flex items-start gap-2">
+                          <Hourglass className="text-purple-600 mt-0.5 flex-shrink-0" size={18} />
+                          <div>
+                            <p className="font-medium text-purple-800 text-sm">延期申请审批中</p>
+                            <p className="text-xs text-purple-600 mt-0.5">
+                              {pending.reason} · 申请至 {formatDate(pending.newReviewTime)}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="flex items-start justify-between gap-3 mb-3">
                       <div className="flex-1">
                         <div className="flex items-center gap-2 flex-wrap mb-1">
@@ -690,6 +852,7 @@ export default function IssueDetail() {
                             style={{ backgroundColor: PLAN_SYNC_STATUS_COLORS[plan.status] }}>
                             {PLAN_SYNC_STATUS_LABELS[plan.status]}
                           </span>
+                          <DueStatusBadge status={plan.dueStatus} />
                           {plan.lastSyncError && (
                             <span className="text-xs text-red-600 flex items-center gap-1">
                               <AlertCircle size={12} /> {plan.lastSyncError}
@@ -700,13 +863,27 @@ export default function IssueDetail() {
                               <AlertTriangle size={12} /> 存在冲突
                             </span>
                           )}
+                          {approvedRecords.length > 0 && (
+                            <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded">
+                              已延期 {plan.delayCount} 次
+                            </span>
+                          )}
                         </div>
                         <p className="text-xs text-gray-400 font-mono">
                           {plan.id.slice(0, 16)}... · 创建于 {formatDate(plan.createdAt)}
                         </p>
                       </div>
                       <div className="flex items-center gap-1">
-                        {canEdit && (
+                        {canRequestDelayP && !pending && (
+                          <button
+                            onClick={() => openDelayForm(plan)}
+                            className="p-1.5 text-purple-600 hover:text-purple-800 hover:bg-purple-50 rounded"
+                            title="申请延期"
+                          >
+                            <Hourglass size={16} />
+                          </button>
+                        )}
+                        {canEditP && (
                           <>
                             <button
                               onClick={() => openEditPlan(plan)}
@@ -732,7 +909,16 @@ export default function IssueDetail() {
                         <Calendar size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
                         <div>
                           <p className="text-xs text-gray-500">复查时间</p>
-                          <p className="font-medium text-gray-800">{formatDate(plan.reviewTime)}</p>
+                          <p className={cn(
+                            'font-medium',
+                            plan.dueStatus === 'overdue' && 'text-red-600',
+                            plan.dueStatus === 'due_soon' && 'text-yellow-700',
+                          )}>{formatDate(plan.reviewTime)}</p>
+                          {plan.originalReviewTime && plan.originalReviewTime !== plan.reviewTime && (
+                            <p className="text-xs text-gray-400 line-through">
+                              原定 {formatDate(plan.originalReviewTime)}
+                            </p>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-start gap-2">
@@ -745,6 +931,18 @@ export default function IssueDetail() {
                           </p>
                         </div>
                       </div>
+                      {plan.lastDelayReason && approvedRecords.length > 0 && (
+                        <div className="col-span-2 flex items-start gap-2">
+                          <FileText size={16} className="text-purple-400 mt-0.5 flex-shrink-0" />
+                          <div className="flex-1">
+                            <p className="text-xs text-purple-500">最后延期</p>
+                            <p className="text-sm text-gray-700">
+                              原因：{plan.lastDelayReason}
+                              {plan.lastApproverName && <span className="text-purple-600"> · 审批人：{plan.lastApproverName}</span>}
+                            </p>
+                          </div>
+                        </div>
+                      )}
                       {plan.rectificationNote && (
                         <div className="col-span-2 flex items-start gap-2">
                           <FileText size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
@@ -764,6 +962,7 @@ export default function IssueDetail() {
                                 <span key={att.id} className="inline-flex items-center gap-1 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs">
                                   <File size={12} />
                                   {att.name}
+                                  {att.summary && <span className="text-gray-500 ml-1">（{att.summary}）</span>}
                                   {att.placeholder && <span className="text-orange-600">（占位）</span>}
                                 </span>
                               ))}
@@ -772,6 +971,42 @@ export default function IssueDetail() {
                         </div>
                       )}
                     </div>
+
+                    {approvedRecords.length > 0 && (
+                      <div className="mt-4 pt-3 border-t border-gray-100">
+                        <button
+                          onClick={(e) => {
+                            const el = e.currentTarget.nextElementSibling as HTMLElement;
+                            if (el) el.classList.toggle('hidden');
+                            const icon = e.currentTarget.querySelector('svg');
+                            if (icon) icon.classList.toggle('rotate-180');
+                          }}
+                          className="w-full flex items-center justify-between text-xs text-gray-500 hover:text-gray-700"
+                        >
+                          <span>延期记录（{approvedRecords.length}）</span>
+                          <ChevronDown size={14} className="transition-transform" />
+                        </button>
+                        <div className="hidden mt-2 space-y-2">
+                          {approvedRecords.sort(
+                            (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+                          ).map(r => (
+                            <div key={r.id} className="bg-gray-50 rounded p-2.5 text-xs border border-gray-100">
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="font-medium text-gray-700">{r.requesterName} 申请</span>
+                                <span className="text-green-600 bg-green-50 px-1.5 py-0.5 rounded">已批准 · {r.approverName}</span>
+                              </div>
+                              <p className="text-gray-600 mb-1">
+                                {formatDate(r.oldReviewTime)} → {formatDate(r.newReviewTime)}
+                              </p>
+                              <p className="text-gray-500">原因：{r.reason}</p>
+                              {r.approvalRemark && (
+                                <p className="text-purple-600 mt-1">审批说明：{r.approvalRemark}</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -860,6 +1095,152 @@ export default function IssueDetail() {
               >
                 <Save size={16} />
                 {editingPlan ? '保存修改' : '创建计划'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showDelayForm && (() => {
+        const plan = visiblePlans.find(p => p.id === showDelayForm);
+        return (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+              <div className="p-5 border-b flex items-center justify-between">
+                <h3 className="font-bold text-lg text-gray-900">申请延期</h3>
+                <button onClick={() => setShowDelayForm(null)}
+                  className="p-1 text-gray-400 hover:text-gray-600 rounded">
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="p-5 space-y-4">
+                <div className="bg-purple-50 rounded-lg p-3 text-xs text-purple-800">
+                  <p className="font-medium mb-1">当前复查时间</p>
+                  <p>{plan ? formatDate(plan.reviewTime) : '-'}</p>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">延期原因 *</label>
+                  <textarea
+                    rows={3}
+                    value={delayForm.reason}
+                    onChange={e => setDelayForm(f => ({ ...f, reason: e.target.value }))}
+                    placeholder="请描述延期的具体原因..."
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40 resize-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">新复查时间 *</label>
+                  <input
+                    type="datetime-local"
+                    value={delayForm.newReviewTime}
+                    onChange={e => setDelayForm(f => ({ ...f, newReviewTime: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">附件摘要</label>
+                  <textarea
+                    rows={2}
+                    value={delayForm.attachmentSummary}
+                    onChange={e => setDelayForm(f => ({ ...f, attachmentSummary: e.target.value }))}
+                    placeholder="如有相关证明材料，请在此简要描述..."
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40 resize-none"
+                  />
+                </div>
+              </div>
+              <div className="p-5 border-t bg-gray-50 flex gap-3 justify-end">
+                <button onClick={() => setShowDelayForm(null)}
+                  className="px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50">取消</button>
+                <button onClick={() => handleSubmitDelay(showDelayForm)}
+                  className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 flex items-center gap-2">
+                  <Hourglass size={16} />
+                  提交延期申请
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {showApproveForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-lg">
+            <div className="p-5 border-b flex items-center justify-between">
+              <h3 className="font-bold text-lg text-gray-900">批准延期申请</h3>
+              <button onClick={() => setShowApproveForm(null)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="bg-green-50 rounded-lg p-3 text-sm text-green-800 space-y-1">
+                <p><span className="font-medium">申请人：</span>{showApproveForm.requesterName}（{getRoleName(showApproveForm.requesterRole)}）</p>
+                <p><span className="font-medium">原因：</span>{showApproveForm.reason}</p>
+                <p><span className="font-medium">原时间：</span>{formatDate(showApproveForm.oldReviewTime)}</p>
+                <p><span className="font-medium">新时间：</span>{formatDate(showApproveForm.newReviewTime)}</p>
+                {showApproveForm.attachmentSummary && (
+                  <p><span className="font-medium">附件摘要：</span>{showApproveForm.attachmentSummary}</p>
+                )}
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">审批说明（可选）</label>
+                <textarea
+                  rows={2}
+                  value={approveRemark}
+                  onChange={e => setApproveRemark(e.target.value)}
+                  placeholder="请在此补充审批说明..."
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40 resize-none"
+                />
+              </div>
+            </div>
+            <div className="p-5 border-t bg-gray-50 flex gap-3 justify-end">
+              <button onClick={() => setShowApproveForm(null)}
+                className="px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50">取消</button>
+              <button onClick={handleApproveDelay}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 flex items-center gap-2">
+                <CheckCircle size={16} />
+                确认批准
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRejectDelayForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-lg">
+            <div className="p-5 border-b flex items-center justify-between">
+              <h3 className="font-bold text-lg text-gray-900">驳回延期申请</h3>
+              <button onClick={() => setShowRejectDelayForm(null)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded">
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div className="bg-red-50 rounded-lg p-3 text-sm text-red-800 space-y-1">
+                <p><span className="font-medium">申请人：</span>{showRejectDelayForm.requesterName}（{getRoleName(showRejectDelayForm.requesterRole)}）</p>
+                <p><span className="font-medium">原因：</span>{showRejectDelayForm.reason}</p>
+                <p><span className="font-medium">原时间：</span>{formatDate(showRejectDelayForm.oldReviewTime)}</p>
+                <p><span className="font-medium">新时间：</span>{formatDate(showRejectDelayForm.newReviewTime)}</p>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">驳回原因 *</label>
+                <textarea
+                  rows={3}
+                  value={rejectDelayRemark}
+                  onChange={e => setRejectDelayRemark(e.target.value)}
+                  placeholder="请填写驳回的具体原因..."
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40 resize-none"
+                />
+              </div>
+            </div>
+            <div className="p-5 border-t bg-gray-50 flex gap-3 justify-end">
+              <button onClick={() => setShowRejectDelayForm(null)}
+                className="px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50">取消</button>
+              <button onClick={handleRejectDelay}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2">
+                <XCircle size={16} />
+                确认驳回
               </button>
             </div>
           </div>

@@ -9,6 +9,8 @@ export interface User {
 
 export type PlanSyncStatus = 'draft' | 'pending' | 'syncing' | 'failed' | 'completed';
 
+export type PlanDueStatus = 'normal' | 'due_soon' | 'overdue' | 'delay_requested' | 'delay_approved' | 'delay_rejected';
+
 export interface PlanAttachment {
   id: string;
   name: string;
@@ -18,12 +20,36 @@ export interface PlanAttachment {
   placeholder?: boolean;
   uploadedAt: string;
   uploaderId: string;
+  summary?: string;
+}
+
+export interface PlanDelayRecord {
+  id: string;
+  planId: string;
+  issueId: string;
+  reason: string;
+  newReviewTime: string;
+  oldReviewTime: string;
+  attachmentSummary: string;
+  attachmentIds?: string[];
+  requesterId: string;
+  requesterRole: UserRole;
+  requesterName?: string;
+  approverId?: string;
+  approverRole?: UserRole;
+  approverName?: string;
+  approvalRemark?: string;
+  status: 'pending' | 'approved' | 'rejected';
+  requestedAt: string;
+  approvedAt?: string;
+  rejectedAt?: string;
 }
 
 export interface ReviewPlan {
   id: string;
   issueId: string;
   reviewTime: string;
+  originalReviewTime?: string;
   assigneeId: string;
   assigneeName?: string;
   assigneeRole?: UserRole;
@@ -38,6 +64,19 @@ export interface ReviewPlan {
   updatedAt: string;
   lastSyncError?: string;
   lastSyncAttempt?: string;
+  delayCount: number;
+  delayRecords: PlanDelayRecord[];
+  pendingDelayRequest?: PlanDelayRecord;
+  lastDelayReason?: string;
+  lastApproverId?: string;
+  lastApproverName?: string;
+  dueStatus?: PlanDueStatus;
+  hasTimeConflict?: boolean;
+  timeConflictInfo?: {
+    localReviewTime: string;
+    remoteReviewTime: string;
+    detectedAt: string;
+  };
 }
 
 export interface PlanConflict {
@@ -62,7 +101,12 @@ export type PlanHistoryAction =
   | 'plan_sync'
   | 'plan_sync_fail'
   | 'plan_handover_export'
-  | 'plan_handover_import';
+  | 'plan_handover_import'
+  | 'plan_delay_request'
+  | 'plan_delay_approve'
+  | 'plan_delay_reject'
+  | 'plan_time_conflict_mark'
+  | 'plan_time_conflict_resolve';
 
 export interface PlanHistoryDetail {
   field?: string;
@@ -71,6 +115,13 @@ export interface PlanHistoryDetail {
   conflictResolution?: 'local' | 'remote' | 'merge';
   localVersion?: ReviewPlan;
   remoteVersion?: ReviewPlan;
+  delayRecord?: PlanDelayRecord;
+  timeConflict?: {
+    resolution: 'local' | 'remote' | 'merge';
+    localReviewTime: string;
+    remoteReviewTime: string;
+    mergedRemark?: string;
+  };
 }
 
 export interface Store {
@@ -289,6 +340,7 @@ export interface ExportPayload {
   unresolvedConflicts: Conflict[];
   reviewPlans: ReviewPlan[];
   unresolvedPlanConflicts: PlanConflict[];
+  planDelayRecords?: PlanDelayRecord[];
   exportedAt: string;
   exportedBy?: {
     id: string;

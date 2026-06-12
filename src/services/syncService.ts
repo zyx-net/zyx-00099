@@ -1,6 +1,6 @@
 import {
   Issue, Conflict, SyncQueueItem, Template, Store, MigrationRecord,
-  ReviewPlan, PlanConflict, PlanSyncStatus, User, History,
+  ReviewPlan, PlanConflict, PlanDelayRecord, PlanSyncStatus, User, History,
   HandoverPackage, HandoverValidationResult, HandoverPlanItem, HandoverConflictType,
 } from '@/types';
 import { generateId } from '@/utils/helpers';
@@ -212,6 +212,36 @@ export function diffReviewPlans(
   return diffs;
 }
 
+export function detectTimeConflict(
+  localPlan: ReviewPlan,
+  remotePlan: ReviewPlan
+): { hasConflict: boolean; localReviewTime: string; remoteReviewTime: string } {
+  const hasConflict = localPlan.reviewTime !== remotePlan.reviewTime;
+  return {
+    hasConflict,
+    localReviewTime: localPlan.reviewTime,
+    remoteReviewTime: remotePlan.reviewTime,
+  };
+}
+
+export function mergePlanRemark(
+  localPlan: ReviewPlan,
+  remotePlan: ReviewPlan
+): { reviewTime: string; rectificationNote: string } {
+  const localNote = localPlan.rectificationNote || '';
+  const remoteNote = remotePlan.rectificationNote || '';
+  let mergedNote = '';
+  if (localNote && remoteNote && localNote !== remoteNote) {
+    mergedNote = [localNote, `--- 远端备注 ---\n${remoteNote}`].join('\n\n');
+  } else {
+    mergedNote = localNote || remoteNote;
+  }
+  return {
+    reviewTime: remotePlan.reviewTime || localPlan.reviewTime,
+    rectificationNote: mergedNote,
+  };
+}
+
 export function mergeReviewPlans(localPlan: ReviewPlan, remotePlan: ReviewPlan): ReviewPlan {
   return {
     ...localPlan,
@@ -242,6 +272,7 @@ export function exportToJSON(
     unresolvedConflicts?: Conflict[];
     reviewPlans?: ReviewPlan[];
     unresolvedPlanConflicts?: PlanConflict[];
+    planDelayRecords?: PlanDelayRecord[];
     exportedAt?: string;
     exportedBy?: { id: string; role: any; name: string };
   }
@@ -255,6 +286,7 @@ export function exportToJSON(
     data.exportedBy as any,
     data.reviewPlans || [],
     data.unresolvedPlanConflicts || [],
+    data.planDelayRecords || [],
   );
   return JSON.stringify(payload, null, 2);
 }

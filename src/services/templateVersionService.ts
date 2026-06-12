@@ -18,8 +18,10 @@ import {
   UserRole,
   ReviewPlan,
   PlanConflict,
+  PlanDelayRecord,
+  PlanDueStatus,
 } from '@/types';
-import { generateId } from '@/utils/helpers';
+import { generateId, normalizeReviewPlanDefaults, DUE_STATUS_LABELS } from '@/utils/helpers';
 
 export function compareSemanticVersions(a: string, b: string): number {
   const partsA = a.split('.').map(Number);
@@ -462,16 +464,37 @@ export function buildExportPayload(
   unresolvedConflicts: Conflict[],
   currentUser?: User,
   reviewPlans: ReviewPlan[] = [],
-  unresolvedPlanConflicts: PlanConflict[] = []
+  unresolvedPlanConflicts: PlanConflict[] = [],
+  planDelayRecords: PlanDelayRecord[] = []
 ): ExportPayload {
-  const normalizedPlans = reviewPlans.map(plan => ({
-    ...plan,
-    attachments: (plan.attachments || []).map(att => ({
-      ...att,
-      url: undefined,
-      placeholder: true,
-    })),
-  }));
+  const plansByDelay = new Map<string, PlanDelayRecord[]>();
+  for (const rec of planDelayRecords) {
+    const arr = plansByDelay.get(rec.planId) || [];
+    arr.push(rec);
+    plansByDelay.set(rec.planId, arr);
+  }
+  const normalizedPlans = reviewPlans.map(plan => {
+    const base = normalizeReviewPlanDefaults(plan as any);
+    const delayRecs = plansByDelay.get(plan.id) || base.delayRecords || [];
+    const pending = delayRecs.find(r => r.status === 'pending');
+    const approvedLast = [...delayRecs].filter(r => r.status === 'approved').sort(
+      (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+    )[0];
+    return {
+      ...base,
+      delayRecords: delayRecs,
+      pendingDelayRequest: pending,
+      delayCount: delayRecs.filter(r => r.status === 'approved').length,
+      lastDelayReason: approvedLast?.reason || base.lastDelayReason,
+      lastApproverId: approvedLast?.approverId || base.lastApproverId,
+      lastApproverName: approvedLast?.approverName || base.lastApproverName,
+      attachments: (base.attachments || []).map(att => ({
+        ...att,
+        url: undefined,
+        placeholder: true,
+      })),
+    };
+  });
   return {
     issues,
     stores,
@@ -480,11 +503,12 @@ export function buildExportPayload(
     unresolvedConflicts,
     reviewPlans: normalizedPlans,
     unresolvedPlanConflicts,
+    planDelayRecords,
     exportedAt: new Date().toISOString(),
     exportedBy: currentUser
       ? { id: currentUser.id, role: currentUser.role, name: currentUser.name }
       : undefined,
-    schemaVersion: '3.0',
+    schemaVersion: '4.0',
   };
 }
 
@@ -501,18 +525,28 @@ export function parseExportPayload(raw: any): {
     return { valid: false, warnings, errors: ['导入文件不是有效的 JSON 对象'] };
   }
 
-  if (raw.schemaVersion && raw.schemaVersion !== '3.0' && raw.schemaVersion !== '2.0') {
-    warnings.push(`导入文件 schema 版本为 ${raw.schemaVersion}，当前版本 3.0，部分字段可能不兼容`);
+  const declaredVer: string = (raw.schemaVersion as string) || '1.0';
+  if (declaredVer !== '4.0') {
+    warnings.push(
+      `📦 备份 schema 版本为 v${declaredVer}，当前支持 v4.0。已自动为缺失字段补充默认值，旧数据不会报废。`
+    );
+    if (['1.0', '2.0'].includes(declaredVer)) {
+      warnings.push(`  · 注意 v${declaredVer} 备份可能不包含「复查整改计划」，对应部分将为空。`);
+    }
+    if (['1.0', '2.0', '3.0'].includes(declaredVer)) {
+      warnings.push(`  · 旧版本未包含「到期状态/延期记录/时间冲突」等字段，已补默认值（到期状态=normal、延期次数=0等）。`);
+    }
   }
 
   if (!Array.isArray(raw.issues)) errors.push('缺少 issues 数组');
   if (!Array.isArray(raw.stores)) errors.push('缺少 stores 数组');
   if (!Array.isArray(raw.templates)) errors.push('缺少 templates 数组');
 
-  if (!raw.migrations) warnings.push('导入文件不包含迁移记录');
-  if (!raw.unresolvedConflicts) warnings.push('导入文件不包含未解决冲突记录');
-  if (!raw.reviewPlans) warnings.push('导入文件不包含复查整改计划');
-  if (!raw.unresolvedPlanConflicts) warnings.push('导入文件不包含复查计划冲突记录');
+  if (!raw.migrations) warnings.push('导入文件不包含迁移记录，已用空数组代替。');
+  if (!raw.unresolvedConflicts) warnings.push('导入文件不包含未解决冲突记录，已用空数组代替。');
+  if (!raw.reviewPlans) warnings.push('导入文件不包含复查整改计划，已用空数组代替。');
+  if (!raw.unresolvedPlanConflicts) warnings.push('导入文件不包含复查计划冲突记录，已用空数组代替。');
+  if (!raw.planDelayRecords) warnings.push('导入文件不包含延期申请记录，已用空数组代替。');
 
   if (errors.length > 0) {
     return { valid: false, warnings, errors };
@@ -520,22 +554,65 @@ export function parseExportPayload(raw: any): {
 
   const payload = raw as ExportPayload;
 
+  if (!payload.migrations) payload.migrations = [];
+  if (!payload.unresolvedConflicts) payload.unresolvedConflicts = [];
+  if (!payload.reviewPlans) payload.reviewPlans = [];
+  if (!payload.unresolvedPlanConflicts) payload.unresolvedPlanConflicts = [];
+  (payload as any).planDelayRecords = (payload as any).planDelayRecords || [];
+
   for (const issue of payload.issues) {
     if (!issue.templateVersion) {
       issue.templateVersion = '1.0';
-      warnings.push(`问题 ${issue.id} 缺少 templateVersion，已默认补为 v1.0`);
+      warnings.push(`问题「${issue.title || issue.id}」缺少 templateVersion，已默认补为 v1.0`);
     }
   }
 
-  if (!payload.reviewPlans) payload.reviewPlans = [];
-  if (!payload.unresolvedPlanConflicts) payload.unresolvedPlanConflicts = [];
+  const planDelayByPlan = new Map<string, PlanDelayRecord[]>();
+  for (const rec of ((payload as any).planDelayRecords || [])) {
+    const arr = planDelayByPlan.get(rec.planId) || [];
+    arr.push(rec);
+    planDelayByPlan.set(rec.planId, arr);
+  }
+
+  const normalizedReviewPlans: ReviewPlan[] = [];
+  for (let i = 0; i < payload.reviewPlans.length; i++) {
+    const plan = payload.reviewPlans[i];
+    const before = JSON.stringify(plan);
+    const planDelayRecords = planDelayByPlan.get(plan.id) || (plan as any).delayRecords || [];
+    const normalized = normalizeReviewPlanDefaults(plan as any);
+
+    normalized.delayRecords = planDelayRecords;
+    if (planDelayRecords.length > 0) {
+      normalized.pendingDelayRequest = planDelayRecords.find((r: PlanDelayRecord) => r.status === 'pending');
+      normalized.delayCount = planDelayRecords.filter((r: PlanDelayRecord) => r.status === 'approved').length;
+      const lastApproved = [...planDelayRecords]
+        .filter((r: PlanDelayRecord) => r.status === 'approved')
+        .sort((a: any, b: any) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime())[0];
+      if (lastApproved) {
+        normalized.lastDelayReason = normalized.lastDelayReason || (lastApproved as PlanDelayRecord).reason;
+        normalized.lastApproverId = normalized.lastApproverId || (lastApproved as PlanDelayRecord).approverId;
+        normalized.lastApproverName = normalized.lastApproverName || (lastApproved as PlanDelayRecord).approverName;
+      }
+    }
+    normalizedReviewPlans.push(normalized);
+
+    const after = JSON.stringify(normalized);
+    if (before.length !== after.length || !(plan as any).dueStatus) {
+      if (i < 3) {
+        warnings.push(`复查计划 ${plan.id.slice(0, 12)}… 已补齐默认字段（到期状态：${DUE_STATUS_LABELS[normalized.dueStatus]}，延期次数：${normalized.delayCount}）`);
+      } else if (i === 3) {
+        warnings.push(`… 其余 ${payload.reviewPlans.length - 3} 个复查计划同样已补齐默认字段。`);
+      }
+    }
+  }
+  payload.reviewPlans = normalizedReviewPlans;
 
   for (const plan of payload.reviewPlans) {
     if (!plan.assigneeId) {
-      warnings.push(`复查计划 ${plan.id} 缺少责任人，需手动补全`);
+      warnings.push(`复查计划 ${plan.id} 缺少责任人，导入后需手动补全。`);
     }
     if ((plan.attachments || []).some((a: any) => a.placeholder)) {
-      warnings.push(`复查计划 ${plan.id} 包含占位附件，需重新上传`);
+      warnings.push(`复查计划 ${plan.id} 包含占位附件，需重新上传。`);
     }
   }
 
@@ -588,6 +665,10 @@ export function generateCSVWithVersions(
     '复查计划摘要',
     '复查计划冲突数',
     '附件占位信息',
+    '到期状态',
+    '延期次数',
+    '最后延期原因',
+    '审批人',
   ];
 
   const rows = issues.map(issue => {
@@ -613,6 +694,17 @@ export function generateCSVWithVersions(
     const planCreators = plans.map(p => p.creatorId).join('; ');
     const planAttachmentCounts = plans.map(p => (p.attachments || []).length).join('; ');
     const planNotes = plans.map(p => (p.rectificationNote || '').replace(/"/g, "'").replace(/\n/g, ' ')).join(' | ');
+
+    const planDueStatuses = plans.map(p =>
+      DUE_STATUS_LABELS[p.dueStatus as PlanDueStatus] || '正常'
+    ).join('; ');
+    const planDelayCounts = plans.map(p => String(p.delayCount || 0)).join('; ');
+    const planLastDelayReasons = plans.map(p =>
+      (p.lastDelayReason || '').replace(/"/g, "'").replace(/\n/g, ' ')
+    ).join(' | ');
+    const planApprovers = plans.map(p =>
+      p.lastApproverName || p.lastApproverId || ''
+    ).join('; ');
     
     return [
       issue.id,
@@ -643,6 +735,10 @@ export function generateCSVWithVersions(
       planSummary,
       0,
       attachmentPlaceholder,
+      planDueStatuses,
+      planDelayCounts,
+      planLastDelayReasons,
+      planApprovers,
     ];
   });
 

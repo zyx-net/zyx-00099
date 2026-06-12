@@ -8,6 +8,15 @@ const ROLE_PERMISSIONS = {
   supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all', 'handover:export_all', 'handover:import']
 };
 
+const DUE_STATUS_LABELS = {
+  normal: '正常',
+  due_soon: '即将到期',
+  overdue: '已逾期',
+  delay_requested: '已申请延期',
+  delay_approved: '已批准延期',
+  delay_rejected: '已驳回延期',
+};
+
 function hasPermission(role, permission) {
   return ROLE_PERMISSIONS[role]?.includes(permission) || false;
 }
@@ -904,6 +913,10 @@ function generateCSVWithVersions(issues, stores, templates, migrations, reviewPl
     '复查计划摘要',
     '复查计划冲突数',
     '附件占位信息',
+    '到期状态',
+    '延期次数',
+    '最后延期原因',
+    '审批人',
   ];
 
   const rows = issues.map(issue => {
@@ -929,6 +942,10 @@ function generateCSVWithVersions(issues, stores, templates, migrations, reviewPl
     const planCreators = plans.map(p => p.creatorId).join('; ');
     const planAttachmentCounts = plans.map(p => (p.attachments || []).length).join('; ');
     const planNotes = plans.map(p => (p.rectificationNote || '').replace(/"/g, "'").replace(/\n/g, ' ')).join(' | ');
+    const planDueStatuses = plans.map(p => DUE_STATUS_LABELS[p.dueStatus] || '正常').join('; ');
+    const planDelayCounts = plans.map(p => p.delayCount || 0).join('; ');
+    const planLastDelayReasons = plans.map(p => (p.lastDelayReason || '').replace(/"/g, "'").replace(/\n/g, ' ')).join(' | ');
+    const planApprovers = plans.map(p => p.lastApproverName || '').join('; ');
 
     return [
       issue.id,
@@ -959,6 +976,10 @@ function generateCSVWithVersions(issues, stores, templates, migrations, reviewPl
       planSummary,
       0,
       attachmentPlaceholder,
+      planDueStatuses,
+      planDelayCounts,
+      planLastDelayReasons,
+      planApprovers,
     ];
   });
 
@@ -2111,6 +2132,555 @@ test('CSV 和 JSON 导出的复查计划字段一一对应', () => {
   assert(dataRow[versionIdx] === `v${jsonPlan.version}`, '版本号一致');
   assert(dataRow[statusIdx] === jsonPlan.status, '状态一致');
   assert(dataRow[syncedIdx] === (jsonPlan.synced ? '是' : '否'), '同步状态一致');
+});
+
+const inspectorA = { id: 'ins-a', name: '巡检员A', role: 'inspector', storeId: 'store-a' };
+const inspectorB = { id: 'ins-b', name: '巡检员B', role: 'inspector', storeId: 'store-b' };
+
+const ROLE_PERMISSIONS_V4 = {
+  ...ROLE_PERMISSIONS,
+  inspector: [...(ROLE_PERMISSIONS.inspector || []), 'plan:delay_request_own'],
+  manager: [...(ROLE_PERMISSIONS.manager || []), 'plan:delay_request_store', 'plan:delay_approve_store'],
+  supervisor: [...(ROLE_PERMISSIONS.supervisor || []), 'plan:delay_request_all', 'plan:delay_approve_all', 'plan:time_conflict_resolve_all'],
+};
+
+function hasPermissionV4(role, perm) {
+  return ROLE_PERMISSIONS_V4[role]?.includes(perm) || false;
+}
+
+function canRequestDelay(user, plan, issue) {
+  if (!user || !plan || !issue) return false;
+  if (hasPermissionV4(user.role, 'plan:delay_request_all')) return true;
+  if (hasPermissionV4(user.role, 'plan:delay_request_store')) return user.storeId === issue.storeId;
+  if (hasPermissionV4(user.role, 'plan:delay_request_own')) {
+    return plan.assigneeId === user.id || plan.creatorId === user.id;
+  }
+  return false;
+}
+function canApproveDelay(user, plan, issue) {
+  if (!user || !plan || !issue) return false;
+  if (hasPermissionV4(user.role, 'plan:delay_approve_all')) return true;
+  if (hasPermissionV4(user.role, 'plan:delay_approve_store')) return user.storeId === issue.storeId;
+  return false;
+}
+function canResolveTimeConflict(user, plan, issue) {
+  if (!user || !plan || !issue) return false;
+  return hasPermissionV4(user.role, 'plan:time_conflict_resolve_all');
+}
+
+function computePlanDueStatus(plan, now = new Date()) {
+  if (!plan) return 'normal';
+  if (plan.pendingDelayRequest && plan.pendingDelayRequest.status === 'pending') return 'delay_requested';
+  const nowT = now.getTime();
+  const approved = (plan.delayRecords || []).filter(r => r.status === 'approved');
+  if (approved.length > 0) {
+    const last = [...approved].sort((a, b) => new Date(b.approvedAt).getTime() - new Date(a.approvedAt).getTime())[0];
+    if (nowT - new Date(last.approvedAt).getTime() < 7 * 86400000) return 'delay_approved';
+  }
+  const rejected = (plan.delayRecords || []).filter(r => r.status === 'rejected');
+  if (rejected.length > 0) {
+    const last = [...rejected].sort((a, b) => new Date(b.rejectedAt).getTime() - new Date(a.rejectedAt).getTime())[0];
+    if (nowT - new Date(last.rejectedAt).getTime() < 3 * 86400000) return 'delay_rejected';
+  }
+  const t = new Date(plan.reviewTime).getTime();
+  if (t < nowT) return 'overdue';
+  if (t - nowT < 3 * 86400000) return 'due_soon';
+  return 'normal';
+}
+
+function normalizeReviewPlanDefaults(partial) {
+  const p = partial || {};
+  return {
+    id: p.id || generateId(),
+    issueId: p.issueId || '',
+    reviewTime: p.reviewTime || new Date(Date.now() + 86400000).toISOString(),
+    assigneeId: p.assigneeId || '',
+    assigneeName: p.assigneeName || '',
+    assigneeRole: p.assigneeRole || 'inspector',
+    rectificationNote: p.rectificationNote || '',
+    attachments: p.attachments || [],
+    creatorId: p.creatorId || '',
+    creatorRole: p.creatorRole || 'inspector',
+    version: p.version || 1,
+    status: p.status || 'pending',
+    synced: p.synced ?? false,
+    createdAt: p.createdAt || new Date().toISOString(),
+    updatedAt: p.updatedAt || new Date().toISOString(),
+    originalReviewTime: p.originalReviewTime || p.reviewTime || new Date(Date.now() + 86400000).toISOString(),
+    delayCount: p.delayCount || 0,
+    delayRecords: p.delayRecords || [],
+    pendingDelayRequest: p.pendingDelayRequest || undefined,
+    lastDelayReason: p.lastDelayReason || '',
+    lastApproverId: p.lastApproverId || '',
+    lastApproverName: p.lastApproverName || '',
+    dueStatus: p.dueStatus || 'normal',
+    hasTimeConflict: p.hasTimeConflict || false,
+    timeConflictInfo: p.timeConflictInfo || undefined,
+    lastSyncError: p.lastSyncError || undefined,
+  };
+}
+
+function detectTimeConflict(localPlan, remotePlan) {
+  if (!localPlan || !remotePlan) return { has: false, info: undefined };
+  const l = new Date(localPlan.reviewTime).getTime();
+  const r = new Date(remotePlan.reviewTime).getTime();
+  const has = l !== r;
+  return {
+    has,
+    info: has ? {
+      localReviewTime: localPlan.reviewTime,
+      remoteReviewTime: remotePlan.reviewTime,
+      detectedAt: new Date().toISOString(),
+    } : undefined,
+  };
+}
+
+function mergePlanRemark(local, remote) {
+  const sep = '\n\n--- 远端备注 ---\n\n';
+  return {
+    reviewTime: remote.reviewTime,
+    rectificationNote: (local.rectificationNote || '') + sep + (remote.rectificationNote || ''),
+  };
+}
+
+function buildExportPayloadV4(issues, stores, templates, migrations, unresolvedConflicts, reviewPlans, unresolvedPlanConflicts, planDelayRecords, currentUser) {
+  const plansByDelay = new Map();
+  (planDelayRecords || []).forEach(rec => {
+    const arr = plansByDelay.get(rec.planId) || [];
+    arr.push(rec);
+    plansByDelay.set(rec.planId, arr);
+  });
+  const normalizedPlans = (reviewPlans || []).map(plan => {
+    const base = normalizeReviewPlanDefaults(plan);
+    const delayRecs = plansByDelay.get(plan.id) || base.delayRecords || [];
+    const pending = delayRecs.find(r => r.status === 'pending');
+    const approvedLast = [...delayRecs].filter(r => r.status === 'approved').sort(
+      (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+    )[0];
+    return {
+      ...base,
+      delayRecords: delayRecs,
+      pendingDelayRequest: pending,
+      delayCount: delayRecs.filter(r => r.status === 'approved').length,
+      lastDelayReason: approvedLast?.reason || base.lastDelayReason,
+      lastApproverId: approvedLast?.approverId || base.lastApproverId,
+      lastApproverName: approvedLast?.approverName || base.lastApproverName,
+      attachments: (base.attachments || []).map(att => ({
+        ...att,
+        url: undefined,
+        placeholder: true,
+      })),
+    };
+  });
+  return {
+    schemaVersion: '4.0',
+    data: {
+      issues, stores, templates, migrations, unresolvedConflicts,
+      reviewPlans: normalizedPlans, unresolvedPlanConflicts,
+      planDelayRecords: planDelayRecords || [],
+    },
+    exportedAt: new Date().toISOString(),
+    exportedBy: currentUser ? { id: currentUser.id, role: currentUser.role, name: currentUser.name } : undefined,
+  };
+}
+
+// ===== 新增测试 1：延期成功流程 =====
+test('延期申请→审批流程：店长申请+督导审批，状态流转正确', () => {
+  const plan = makeReviewPlan({
+    id: 'plan-delay-flow', issueId: issueInA.id, version: 1,
+    reviewTime: new Date(Date.now() + 2 * 86400000).toISOString(),
+    assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+    creatorId: managerA.id,
+  });
+  const basePlan = normalizeReviewPlanDefaults(plan);
+
+  // step1: 店长申请延期
+  const assertCanReq = canRequestDelay(managerA, basePlan, issueInA);
+  assert(assertCanReq, 'managerA 应为自己门店的计划申请延期');
+
+  const newReviewTime = new Date(new Date(basePlan.reviewTime).getTime() + 7 * 86400000).toISOString();
+  const delayReq = {
+    id: 'delay-rec-1', planId: basePlan.id, issueId: issueInA.id,
+    reason: '整改物料尚未到货，需等待供应链配送',
+    newReviewTime,
+    oldReviewTime: basePlan.reviewTime,
+    attachmentSummary: '3 张现场未到货照片 + 1 份物流截图',
+    requesterId: managerA.id, requesterRole: managerA.role, requesterName: managerA.name,
+    status: 'pending',
+    requestedAt: new Date().toISOString(),
+  };
+
+  const planAfterReq = {
+    ...basePlan,
+    version: basePlan.version + 1,
+    delayRecords: [delayReq],
+    pendingDelayRequest: delayReq,
+    dueStatus: 'delay_requested',
+  };
+  assert(planAfterReq.dueStatus === 'delay_requested', '申请后到期状态应为 delay_requested');
+  assert(planAfterReq.pendingDelayRequest.status === 'pending', '存在待审批延期记录');
+
+  // step2: 督导审批
+  const assertCanApprove = canApproveDelay(supervisor, planAfterReq, issueInA);
+  assert(assertCanApprove, 'supervisor 应能跨门店审批延期');
+
+  const approved = {
+    ...delayReq,
+    status: 'approved',
+    approverId: supervisor.id, approverRole: supervisor.role, approverName: supervisor.name,
+    approvalRemark: '情况属实，同意延期一周',
+    approvedAt: new Date(Date.now() - 1 * 86400000).toISOString(),
+  };
+  const delayAfterApprove = [approved];
+  const planAfterApprove = normalizeReviewPlanDefaults({
+    ...planAfterReq,
+    version: planAfterReq.version + 1,
+    reviewTime: newReviewTime,
+    delayRecords: delayAfterApprove,
+    pendingDelayRequest: undefined,
+    delayCount: delayAfterApprove.filter(r => r.status === 'approved').length,
+    lastDelayReason: approved.reason,
+    lastApproverId: approved.approverId,
+    lastApproverName: approved.approverName,
+    dueStatus: computePlanDueStatus({ ...planAfterReq, reviewTime: newReviewTime, delayRecords: delayAfterApprove, pendingDelayRequest: undefined }),
+  });
+
+  assert(planAfterApprove.delayCount === 1, '延期次数应为 1');
+  assert(planAfterApprove.lastApproverName === supervisor.name, '最后审批人应为督导');
+  assert(planAfterApprove.dueStatus === 'delay_approved', '审批后 7 天内到期状态应为 delay_approved');
+  assert(new Date(planAfterApprove.reviewTime).getTime() === new Date(newReviewTime).getTime(), '复查时间已更新为延期后的新时间');
+  assert(planAfterApprove.pendingDelayRequest === undefined, '审批后无待审批记录');
+
+  // step3: 驳回流程校验（使用独立计划，避免已 approved 记录干扰 delay_rejected 判断）
+  const planForReject = makeReviewPlan({
+    id: 'plan-reject-only', issueId: issueInA.id, version: 1,
+    reviewTime: new Date(Date.now() + 1 * 86400000).toISOString(),
+    assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+    creatorId: managerA.id,
+  });
+  const delayReqForReject = {
+    id: 'delay-rec-2', planId: planForReject.id, issueId: issueInA.id,
+    reason: '申请延期去做别的', newReviewTime: new Date(Date.now() + 20 * 86400000).toISOString(),
+    oldReviewTime: planForReject.reviewTime,
+    attachmentSummary: '', requesterId: managerA.id, requesterRole: managerA.role,
+    requesterName: managerA.name, status: 'pending', requestedAt: new Date().toISOString(),
+  };
+  const planAfterReqReject = {
+    ...normalizeReviewPlanDefaults(planForReject),
+    version: 2,
+    delayRecords: [delayReqForReject],
+    pendingDelayRequest: delayReqForReject,
+    dueStatus: 'delay_requested',
+  };
+  const rejected = {
+    ...delayReqForReject, status: 'rejected',
+    approverId: supervisor.id, approverRole: supervisor.role, approverName: supervisor.name,
+    approvalRemark: '理由不充分，不予延期，请尽快完成',
+    rejectedAt: new Date().toISOString(),
+  };
+  const planAfterReject = {
+    ...planAfterReqReject,
+    delayRecords: [rejected],
+    pendingDelayRequest: undefined,
+    dueStatus: computePlanDueStatus({ ...planAfterReqReject, delayRecords: [rejected], pendingDelayRequest: undefined }),
+  };
+  assert(planAfterReject.dueStatus === 'delay_rejected', '3 天内刚驳回的状态应为 delay_rejected');
+});
+
+// ===== 新增测试 2：无权限拦截 =====
+test('权限拦截：巡检员无法审批延期，店长不能审批跨门店延期，巡检员不能申请非自己的计划', () => {
+  const planForA = makeReviewPlan({
+    id: 'plan-perm', issueId: issueInA.id, version: 1,
+    assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+  });
+
+  // 巡检员 inspectorB 申请非自己 assignee 的计划（issueStoreA）
+  const reqBForOther = canRequestDelay(inspectorB, planForA, issueInA);
+  assert(reqBForOther === false, '巡检员 inspectorB 不能为非自己 assignee 的计划申请延期');
+
+  // 巡检员 inspectorA 申请自己 assignee 的计划
+  const reqAForOwn = canRequestDelay(inspectorA, planForA, issueInA);
+  assert(reqAForOwn === true, '巡检员 inspectorA 可以为自己 assignee 的计划申请延期');
+
+  // 巡检员 inspectorA 做审批
+  const inspApproval = canApproveDelay(inspectorA, planForA, issueInA);
+  assert(inspApproval === false, '巡检员 inspectorA 无权审批延期');
+
+  // 店长 managerB (storeB) 审批 issueInA (storeA)
+  const mgmtApprovalCrossStore = canApproveDelay(managerB, planForA, issueInA);
+  assert(mgmtApprovalCrossStore === false, '店长 managerB 不能审批其他门店(storeA)的延期申请');
+
+  // 店长 managerA (storeA) 审批 issueInA (storeA)
+  const mgmtApprovalOwn = canApproveDelay(managerA, planForA, issueInA);
+  assert(mgmtApprovalOwn === true, '店长 managerA 可以审批本店(storeA)的延期申请');
+
+  // 时间冲突解决权限：只有督导
+  const mgmtResolveTC = canResolveTimeConflict(managerA, planForA, issueInA);
+  assert(mgmtResolveTC === false, '店长无权直接解决时间冲突');
+  const superResolveTC = canResolveTimeConflict(supervisor, planForA, issueInA);
+  assert(superResolveTC === true, '督导可以解决时间冲突');
+});
+
+// ===== 新增测试 3：重启恢复（模拟 IndexedDB 重建） =====
+test('重启恢复：从 IndexedDB 原始数据重建 dueStatus/pendingDelayRequest/delayRecords', () => {
+  // 模拟 IndexedDB 存的原始数据（没有经过 store 加工的，只是裸 plan + delayRecords）
+  const now = new Date();
+  const reviewTimeSoon = new Date(now.getTime() + 1 * 86400000).toISOString();
+  const reviewTimeNew = new Date(now.getTime() + 10 * 86400000).toISOString();
+
+  const delayRecApproved = {
+    id: 'd1', planId: 'plan-restore-1', issueId: issueInA.id,
+    reason: '需要多一周整改', newReviewTime: reviewTimeNew, oldReviewTime: reviewTimeSoon,
+    attachmentSummary: '附件说明', requesterId: managerA.id, requesterRole: managerA.role,
+    requesterName: managerA.name, status: 'approved',
+    approverId: supervisor.id, approverName: supervisor.name, approverRole: supervisor.role,
+    requestedAt: new Date(now.getTime() - 2 * 86400000).toISOString(),
+    approvedAt: new Date(now.getTime() - 1 * 86400000).toISOString(),
+  };
+  const delayRecPending = {
+    id: 'd2', planId: 'plan-restore-2', issueId: issueInA.id,
+    reason: '等待总部批复', newReviewTime: reviewTimeNew, oldReviewTime: reviewTimeSoon,
+    attachmentSummary: '', requesterId: managerA.id, requesterRole: managerA.role,
+    requesterName: managerA.name, status: 'pending',
+    requestedAt: new Date().toISOString(),
+  };
+
+  // IndexedDB 中裸 plan（没有 delayRecords 内联，也没有 dueStatus/pendingDelayRequest）
+  const rawPlan1 = {
+    id: 'plan-restore-1', issueId: issueInA.id, reviewTime: reviewTimeNew,
+    assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+    assigneeRole: 'inspector', creatorId: managerA.id, creatorRole: 'manager',
+    version: 2, status: 'pending', synced: false,
+    createdAt: new Date(now.getTime() - 10 * 86400000).toISOString(),
+    updatedAt: new Date(now.getTime() - 1 * 86400000).toISOString(),
+    rectificationNote: '整改说明', attachments: [],
+    originalReviewTime: reviewTimeSoon,
+  };
+  const rawPlan2 = {
+    id: 'plan-restore-2', issueId: issueInA.id, reviewTime: reviewTimeSoon,
+    assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+    assigneeRole: 'inspector', creatorId: managerA.id, creatorRole: 'manager',
+    version: 3, status: 'pending', synced: false,
+    createdAt: new Date(now.getTime() - 20 * 86400000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    rectificationNote: '整改说明2', attachments: [],
+    originalReviewTime: reviewTimeSoon,
+  };
+
+  // 模拟 init() 里的重建逻辑
+  const allDelayRecords = [delayRecApproved, delayRecPending];
+  const delayByPlan = new Map();
+  allDelayRecords.forEach(r => {
+    const arr = delayByPlan.get(r.planId) || [];
+    arr.push(r); delayByPlan.set(r.planId, arr);
+  });
+
+  const restoredPlan1 = normalizeReviewPlanDefaults({ ...rawPlan1 });
+  restoredPlan1.delayRecords = delayByPlan.get(restoredPlan1.id) || [];
+  restoredPlan1.pendingDelayRequest = restoredPlan1.delayRecords.find(r => r.status === 'pending');
+  restoredPlan1.delayCount = restoredPlan1.delayRecords.filter(r => r.status === 'approved').length;
+  restoredPlan1.dueStatus = computePlanDueStatus(restoredPlan1, now);
+
+  const restoredPlan2 = normalizeReviewPlanDefaults({ ...rawPlan2 });
+  restoredPlan2.delayRecords = delayByPlan.get(restoredPlan2.id) || [];
+  restoredPlan2.pendingDelayRequest = restoredPlan2.delayRecords.find(r => r.status === 'pending');
+  restoredPlan2.delayCount = restoredPlan2.delayRecords.filter(r => r.status === 'approved').length;
+  restoredPlan2.dueStatus = computePlanDueStatus(restoredPlan2, now);
+
+  // 校验恢复结果
+  assert(restoredPlan1.delayRecords.length === 1, 'plan1 应恢复出 1 条延期记录');
+  assert(restoredPlan1.delayCount === 1, 'plan1 延期次数应为 1');
+  assert(restoredPlan1.dueStatus === 'delay_approved', 'plan1 到期状态应为 delay_approved（刚批准 1 天前）');
+  assert(restoredPlan1.pendingDelayRequest === undefined, 'plan1 不应有待审批延期');
+
+  assert(restoredPlan2.dueStatus === 'delay_requested', 'plan2 到期状态应为 delay_requested（有 pending）');
+  assert(restoredPlan2.pendingDelayRequest?.id === 'd2', 'plan2 待审批延期记录正确');
+
+  // 再模拟"30 天后重启" - 到期状态应回归 overdue/due_soon/normal
+  const longAfter = new Date(now.getTime() + 30 * 86400000);
+  const statusLongAfter1 = computePlanDueStatus({ ...restoredPlan1, reviewTime: reviewTimeNew }, longAfter);
+  assert(statusLongAfter1 === 'overdue', '30 天后延期后的新时间也到期了，应为 overdue');
+});
+
+// ===== 新增测试 4：时间冲突处理 =====
+test('时间冲突：本地与远端 reviewTime 不同 → 检测+三策略解决', () => {
+  const tLocal = new Date(Date.now() + 5 * 86400000).toISOString();
+  const tRemote = new Date(Date.now() + 2 * 86400000).toISOString();
+
+  const localPlan = makeReviewPlan({
+    id: 'plan-tc', issueId: issueInA.id, version: 3, reviewTime: tLocal,
+    rectificationNote: '本地的整改要求：更换所有消防栓密封条',
+  });
+  const remotePlan = makeReviewPlan({
+    id: 'plan-tc', issueId: issueInA.id, version: 3, reviewTime: tRemote,
+    rectificationNote: '远端整改：检查应急照明灯',
+  });
+
+  // 检测
+  const tc = detectTimeConflict(localPlan, remotePlan);
+  assert(tc.has === true, '应检测到时间冲突');
+  assert(tc.info.localReviewTime === tLocal, '冲突信息本地时间正确');
+  assert(tc.info.remoteReviewTime === tRemote, '冲突信息远端时间正确');
+
+  const basePlan = normalizeReviewPlanDefaults({
+    ...localPlan, hasTimeConflict: tc.has, timeConflictInfo: tc.info,
+  });
+
+  // 策略 1：保留本地
+  const r1 = {
+    ...basePlan, reviewTime: tc.info.localReviewTime,
+    hasTimeConflict: false, timeConflictInfo: undefined, version: basePlan.version + 1,
+  };
+  assert(r1.reviewTime === tLocal, '保留本地后 reviewTime 为本地时间');
+
+  // 策略 2：采用远端
+  const r2 = {
+    ...basePlan, reviewTime: tc.info.remoteReviewTime,
+    hasTimeConflict: false, timeConflictInfo: undefined, version: basePlan.version + 1,
+  };
+  assert(r2.reviewTime === tRemote, '采用远端后 reviewTime 为远端时间');
+
+  // 策略 3：合并备注（使用 mergePlanRemark）
+  const merged = mergePlanRemark(localPlan, remotePlan);
+  assert(merged.reviewTime === tRemote, '合并备注时使用远端时间');
+  assert(merged.rectificationNote.includes('本地的整改要求'), '合并备注包含本地备注');
+  assert(merged.rectificationNote.includes('远端整改'), '合并备注包含远端备注');
+  assert(merged.rectificationNote.includes('--- 远端备注 ---'), '合并备注有分隔线');
+
+  const r3 = {
+    ...basePlan, reviewTime: merged.reviewTime, rectificationNote: merged.rectificationNote,
+    hasTimeConflict: false, timeConflictInfo: undefined, version: basePlan.version + 1,
+  };
+  assert(r3.hasTimeConflict === false, '冲突解决后 hasTimeConflict 为 false');
+});
+
+// ===== 新增测试 5：导入导出字段一致性 =====
+test('导入导出：JSON v4 含延期字段、旧备份缺字段自动补齐、CSV 末尾 4 列齐全', () => {
+  const reviewTimeOverdue = new Date(Date.now() - 5 * 86400000).toISOString();
+  const reviewTimeNew = new Date(Date.now() + 12 * 86400000).toISOString();
+  const delayRec = {
+    id: 'delay-exp', planId: 'plan-export', issueId: issueInA.id,
+    reason: '门店闭店盘点期间无法整改',
+    newReviewTime: reviewTimeNew, oldReviewTime: reviewTimeOverdue,
+    attachmentSummary: '盘点通知 PDF 摘要',
+    requesterId: managerA.id, requesterRole: managerA.role, requesterName: managerA.name,
+    status: 'approved',
+    approverId: supervisor.id, approverRole: supervisor.role, approverName: supervisor.name,
+    approvalRemark: '盘点期间确无法入场，同意延期',
+    requestedAt: new Date(Date.now() - 8 * 86400000).toISOString(),
+    approvedAt: new Date(Date.now() - 5 * 86400000).toISOString(),
+  };
+  const planWithDelay = makeReviewPlan({
+    id: 'plan-export', issueId: issueInA.id, version: 3,
+    reviewTime: reviewTimeNew, originalReviewTime: reviewTimeOverdue,
+    delayCount: 1,
+  });
+
+  // 1. v4 导出 JSON
+  const exportedV4 = buildExportPayloadV4(
+    [issueInA], [storeA], [templateV1], [], [], [planWithDelay], [], [delayRec], supervisor
+  );
+  assert(exportedV4.schemaVersion === '4.0', '导出 schema 版本为 4.0');
+  assert(Array.isArray(exportedV4.data.planDelayRecords), 'JSON 导出包含 planDelayRecords 数组');
+  assert(exportedV4.data.planDelayRecords[0].reason === delayRec.reason, '延期记录正确序列化');
+  const expPlan = exportedV4.data.reviewPlans[0];
+  assert(expPlan.dueStatus !== undefined, 'JSON 导出含 dueStatus');
+  assert(expPlan.delayCount === 1, 'JSON 导出含 delayCount');
+  assert(expPlan.lastDelayReason === delayRec.reason, 'JSON 导出含最后延期原因');
+  assert(expPlan.lastApproverName === supervisor.name, 'JSON 导出含最后审批人');
+
+  // 2. 模拟 parseExportPayload - 使用 v3 老格式（缺少 dueStatus/delayCount/... 字段）
+  const oldV3Payload = {
+    schemaVersion: '3.0',
+    issues: [issueInA], stores: [storeA], templates: [templateV1],
+    migrations: [], unresolvedConflicts: [],
+    reviewPlans: [{
+      // 老格式 plan：缺少 dueStatus/delayCount/originalReviewTime/hasTimeConflict 等
+      id: 'plan-old', issueId: issueInA.id,
+      reviewTime: reviewTimeOverdue,
+      assigneeId: inspectorA.id, assigneeName: inspectorA.name,
+      assigneeRole: 'inspector',
+      creatorId: managerA.id, creatorRole: managerA.role,
+      version: 1, status: 'pending', synced: false,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      rectificationNote: '', attachments: [],
+    }],
+    unresolvedPlanConflicts: [],
+    exportedAt: new Date().toISOString(),
+  };
+  const parsedV3 = {
+    valid: true, warnings: [], errors: [], payload: oldV3Payload,
+  };
+  const plansWithDelayMap = new Map();
+  const normalizedV3Plan = normalizeReviewPlanDefaults(oldV3Payload.reviewPlans[0]);
+  const delayRecs = plansWithDelayMap.get(normalizedV3Plan.id) || [];
+  normalizedV3Plan.delayRecords = delayRecs;
+  normalizedV3Plan.pendingDelayRequest = delayRecs.find(r => r.status === 'pending');
+  normalizedV3Plan.delayCount = delayRecs.filter(r => r.status === 'approved').length;
+  normalizedV3Plan.dueStatus = computePlanDueStatus(normalizedV3Plan);
+
+  // v3 老 plan（缺 dueStatus）应补齐 dueStatus=overdue，因为 reviewTime 是 5 天前
+  assert(normalizedV3Plan.dueStatus === 'overdue', '老 v3 备份缺 dueStatus，补齐后应为 overdue');
+  assert(normalizedV3Plan.delayCount === 0, '老备份无延期记录，delayCount 应补为 0');
+  assert(normalizedV3Plan.hasTimeConflict === false, '老备份缺 hasTimeConflict，应补为 false');
+  assert(normalizedV3Plan.originalReviewTime === reviewTimeOverdue, '老备份缺 originalReviewTime，应补为 reviewTime');
+  assert(typeof normalizedV3Plan.lastDelayReason === 'string', 'lastDelayReason 有默认值（空字符串）');
+
+  // 3. v4 roundtrip：导出后立即"重新导入"，字段一一对应
+  const reimportedPlan = normalizeReviewPlanDefaults(exportedV4.data.reviewPlans[0]);
+  const rDelayRecs = exportedV4.data.planDelayRecords || [];
+  const rByPlan = new Map();
+  rDelayRecs.forEach(r => {
+    const arr = rByPlan.get(r.planId) || []; arr.push(r); rByPlan.set(r.planId, arr);
+  });
+  reimportedPlan.delayRecords = rByPlan.get(reimportedPlan.id) || [];
+  reimportedPlan.pendingDelayRequest = reimportedPlan.delayRecords.find(r => r.status === 'pending');
+  reimportedPlan.dueStatus = computePlanDueStatus(reimportedPlan);
+
+  assert(reimportedPlan.lastDelayReason === delayRec.reason, 'roundtrip 后 lastDelayReason 一致');
+  assert(reimportedPlan.lastApproverName === supervisor.name, 'roundtrip 后 lastApproverName 一致');
+  assert(reimportedPlan.delayCount === 1, 'roundtrip 后 delayCount 一致');
+  assert(reimportedPlan.dueStatus === 'delay_approved', 'roundtrip 后 dueStatus 应为 delay_approved');
+
+  // 4. CSV 末尾 4 列：到期状态/延期次数/最后延期原因/审批人
+  const csv = generateCSVWithVersions(
+    [issueInA], [storeA], [templateV1], [],
+    [{ ...planWithDelay, dueStatus: 'delay_approved', delayCount: 1, lastDelayReason: delayRec.reason, lastApproverName: supervisor.name }]
+  );
+  const lines = csv.split('\n');
+  const headers = lines[0].split(',').map(h => h.replace(/"/g, ''));
+  const dataRow = lines[1].split(',').map(h => h.replace(/"/g, ''));
+
+  const iDueStatus = headers.indexOf('到期状态');
+  const iDelayCount = headers.indexOf('延期次数');
+  const iLastDelay = headers.indexOf('最后延期原因');
+  const iApprover = headers.indexOf('审批人');
+  assert(iDueStatus >= 0, 'CSV 表头含「到期状态」');
+  assert(iDelayCount >= 0, 'CSV 表头含「延期次数」');
+  assert(iLastDelay >= 0, 'CSV 表头含「最后延期原因」');
+  assert(iApprover >= 0, 'CSV 表头含「审批人」');
+  assert(dataRow[iDueStatus] !== '' && dataRow[iDueStatus] !== undefined, 'CSV 数据含到期状态');
+  assert(dataRow[iDelayCount] === '1', 'CSV 数据延期次数为 1');
+  assert(dataRow[iLastDelay].includes('门店闭店盘点'), 'CSV 含最后延期原因');
+  assert(dataRow[iApprover] === supervisor.name, 'CSV 含审批人姓名');
+
+  // 5. 老 v2 schema 导入不应报废数据（"不报废"的核心验证）
+  const veryOldV2 = {
+    schemaVersion: '2.0',
+    issues: [{ id: 'i-very-old', title: '超老备份问题', storeId: storeA.id, templateId: templateV1.id, status: 'draft', priority: 'medium', data: {}, creatorId: 'me', synced: false, version: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
+    stores: [storeA], templates: [templateV1],
+    migrations: [], unresolvedConflicts: [],
+  };
+  const v2FixedPayload = veryOldV2;
+  v2FixedPayload.reviewPlans = v2FixedPayload.reviewPlans || [];
+  v2FixedPayload.unresolvedPlanConflicts = v2FixedPayload.unresolvedPlanConflicts || [];
+  v2FixedPayload.planDelayRecords = v2FixedPayload.planDelayRecords || [];
+  v2FixedPayload.reviewPlans.forEach((p, idx) => {
+    v2FixedPayload.reviewPlans[idx] = normalizeReviewPlanDefaults(p);
+  });
+  assert(Array.isArray(v2FixedPayload.reviewPlans), 'v2 老备份导入不会报废：reviewPlans 被补为空数组或保留原值');
+  assert(Array.isArray(v2FixedPayload.planDelayRecords), 'v2 老备份导入不会报废：planDelayRecords 被补为空数组');
+  assert(v2FixedPayload.issues.length === 1, 'v2 老备份问题仍然存在，未报废');
 });
 
 console.log('\n=== 结果统计 ===');

@@ -1,4 +1,4 @@
-import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus } from '@/types';
+import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus, PlanDueStatus, ReviewPlan, PlanDelayRecord } from '@/types';
 
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -13,6 +13,100 @@ export function formatDate(date: string | Date): string {
     hour: '2-digit',
     minute: '2-digit'
   });
+}
+
+export const DUE_SOON_DAYS = 3;
+
+export function computePlanDueStatus(plan: ReviewPlan, now: Date = new Date()): PlanDueStatus {
+  if (plan.pendingDelayRequest && plan.pendingDelayRequest.status === 'pending') {
+    return 'delay_requested';
+  }
+  const lastApprovedDelay = [...(plan.delayRecords || [])]
+    .sort((a, b) => new Date(b.approvedAt || b.requestedAt).getTime() - new Date(a.approvedAt || a.requestedAt).getTime())
+    .find(r => r.status === 'approved');
+  if (lastApprovedDelay) {
+    const approvedAt = new Date(lastApprovedDelay.approvedAt || lastApprovedDelay.requestedAt);
+    if ((now.getTime() - approvedAt.getTime()) < 7 * 86400000) {
+      return 'delay_approved';
+    }
+  }
+  const lastRejectedDelay = [...(plan.delayRecords || [])]
+    .sort((a, b) => new Date(b.rejectedAt || b.requestedAt).getTime() - new Date(a.rejectedAt || a.requestedAt).getTime())
+    .find(r => r.status === 'rejected');
+  if (lastRejectedDelay) {
+    const rejectedAt = new Date(lastRejectedDelay.rejectedAt || lastRejectedDelay.requestedAt);
+    if ((now.getTime() - rejectedAt.getTime()) < 3 * 86400000) {
+      return 'delay_rejected';
+    }
+  }
+  const reviewTime = new Date(plan.reviewTime);
+  const diffMs = reviewTime.getTime() - now.getTime();
+  const diffDays = diffMs / 86400000;
+  if (diffMs < 0) return 'overdue';
+  if (diffDays <= DUE_SOON_DAYS) return 'due_soon';
+  return 'normal';
+}
+
+export const DUE_STATUS_LABELS: Record<PlanDueStatus, string> = {
+  normal: '正常',
+  due_soon: '即将到期',
+  overdue: '已逾期',
+  delay_requested: '已申请延期',
+  delay_approved: '已批准延期',
+  delay_rejected: '延期被驳回',
+};
+
+export const DUE_STATUS_COLORS: Record<PlanDueStatus, string> = {
+  normal: 'bg-green-100 text-green-700',
+  due_soon: 'bg-yellow-100 text-yellow-700',
+  overdue: 'bg-red-100 text-red-700',
+  delay_requested: 'bg-orange-100 text-orange-700',
+  delay_approved: 'bg-blue-100 text-blue-700',
+  delay_rejected: 'bg-purple-100 text-purple-700',
+};
+
+export function getPlanLastDelayReason(plan: ReviewPlan): string {
+  const approved = [...(plan.delayRecords || [])]
+    .sort((a, b) => new Date(b.approvedAt || b.requestedAt).getTime() - new Date(a.approvedAt || a.requestedAt).getTime())
+    .find(r => r.status === 'approved');
+  if (approved) return approved.reason;
+  return plan.lastDelayReason || '';
+}
+
+export function getPlanLastApproverName(plan: ReviewPlan): string {
+  const approved = [...(plan.delayRecords || [])]
+    .sort((a, b) => new Date(b.approvedAt || b.requestedAt).getTime() - new Date(a.approvedAt || a.requestedAt).getTime())
+    .find(r => r.status === 'approved');
+  if (approved) return approved.approverName || approved.approverId || '';
+  return plan.lastApproverName || '';
+}
+
+export function normalizeReviewPlanDefaults(p: Partial<ReviewPlan> & { id: string; issueId: string; reviewTime: string; assigneeId: string; rectificationNote: string; attachments: any[]; creatorId: string; creatorRole: UserRole; version: number; status: PlanSyncStatus; synced: boolean; createdAt: string; updatedAt: string }): ReviewPlan {
+  return {
+    ...p,
+    originalReviewTime: p.originalReviewTime || p.reviewTime,
+    delayCount: p.delayCount ?? 0,
+    delayRecords: p.delayRecords || [],
+    pendingDelayRequest: p.pendingDelayRequest || undefined,
+    lastDelayReason: p.lastDelayReason || '',
+    lastApproverId: p.lastApproverId || '',
+    lastApproverName: p.lastApproverName || '',
+    dueStatus: p.dueStatus || 'normal',
+    hasTimeConflict: p.hasTimeConflict ?? false,
+    timeConflictInfo: p.timeConflictInfo || undefined,
+  };
+}
+
+export function buildDelayHistoryRemark(record: PlanDelayRecord, action: 'request' | 'approve' | 'reject'): string {
+  const oldStr = formatDate(record.oldReviewTime);
+  const newStr = formatDate(record.newReviewTime);
+  if (action === 'request') {
+    return `申请延期：${oldStr} → ${newStr}，原因：${record.reason || '未填写'}，附件摘要：${record.attachmentSummary || '无'}`;
+  }
+  if (action === 'approve') {
+    return `批准延期：${oldStr} → ${newStr}，申请人：${record.requesterName || record.requesterId}，审批备注：${record.approvalRemark || '无'}`;
+  }
+  return `驳回延期：${oldStr} → ${newStr}，申请人：${record.requesterName || record.requesterId}，驳回理由：${record.approvalRemark || '未说明'}`;
 }
 
 export const STATUS_LABELS: Record<IssueStatus, string> = {
@@ -94,6 +188,11 @@ export const ACTION_LABELS: Record<HistoryAction, string> = {
   plan_sync_fail: '复查计划同步失败',
   plan_handover_export: '导出交接包',
   plan_handover_import: '导入交接包',
+  plan_delay_request: '申请延期',
+  plan_delay_approve: '批准延期',
+  plan_delay_reject: '驳回延期',
+  plan_time_conflict_mark: '标记时间冲突',
+  plan_time_conflict_resolve: '解决时间冲突',
 };
 
 export function getRoleName(role: UserRole): string {

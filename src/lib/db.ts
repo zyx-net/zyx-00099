@@ -1,11 +1,12 @@
 import { openDB, IDBPDatabase } from 'idb';
 import {
   Issue, Store, Template, History, Conflict, SyncQueueItem, User, MigrationRecord,
-  ReviewPlan, PlanConflict
+  ReviewPlan, PlanConflict, PlanDelayRecord
 } from '@/types';
+import { normalizeReviewPlanDefaults } from '@/utils/helpers';
 
 const DB_NAME = 'inspection-pwa-db';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 export interface DBSchema {
   users: { key: string; value: User };
@@ -16,8 +17,9 @@ export interface DBSchema {
   conflicts: { key: string; value: Conflict; indexes: { 'by-issue': string } };
   syncQueue: { key: string; value: SyncQueueItem; indexes: { 'by-status': string; 'by-issue': string } };
   migrations: { key: string; value: MigrationRecord; indexes: { 'by-template': string; 'by-operator': string } };
-  reviewPlans: { key: string; value: ReviewPlan; indexes: { 'by-issue': string; 'by-assignee': string; 'by-status': string; 'by-creator': string } };
+  reviewPlans: { key: string; value: ReviewPlan; indexes: { 'by-issue': string; 'by-assignee': string; 'by-status': string; 'by-creator': string; 'by-due-status': string } };
   planConflicts: { key: string; value: PlanConflict; indexes: { 'by-issue': string; 'by-plan': string } };
+  planDelayRecords: { key: string; value: PlanDelayRecord; indexes: { 'by-plan': string; 'by-issue': string; 'by-status': string; 'by-requester': string; 'by-approver': string } };
 }
 
 let db: IDBPDatabase<DBSchema> | null = null;
@@ -105,6 +107,30 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
         const pcStore = db.createObjectStore('planConflicts', { keyPath: 'id' });
         pcStore.createIndex('by-issue', 'issueId');
         pcStore.createIndex('by-plan', 'planId');
+      }
+      if (!db.objectStoreNames.contains('planDelayRecords')) {
+        const pdrStore = db.createObjectStore('planDelayRecords', { keyPath: 'id' });
+        pdrStore.createIndex('by-plan', 'planId');
+        pdrStore.createIndex('by-issue', 'issueId');
+        pdrStore.createIndex('by-status', 'status');
+        pdrStore.createIndex('by-requester', 'requesterId');
+        pdrStore.createIndex('by-approver', 'approverId');
+      }
+      if (oldVersion < 4) {
+        const planTx = db.transaction('reviewPlans', 'readwrite');
+        const planStore = planTx.store;
+        const cursorReq = planStore.openCursor();
+        cursorReq.then(function processCursor(cursor) {
+          if (!cursor) return;
+          const p = cursor.value as any;
+          const normalized = normalizeReviewPlanDefaults(p);
+          cursor.update(normalized);
+          return cursor.continue().then(processCursor);
+        }).catch(() => { /* ignore cursor errors */ });
+        const planIdxStore = (planTx as any).store;
+        if (!planIdxStore.indexNames.contains('by-due-status')) {
+          try { planIdxStore.createIndex('by-due-status', 'dueStatus'); } catch { /* ignore */ }
+        }
       }
     },
   });
@@ -355,10 +381,40 @@ export async function updatePlanConflict(conflict: PlanConflict): Promise<string
   return database.put('planConflicts', conflict) as Promise<string>;
 }
 
+export async function getAllPlanDelayRecords(): Promise<PlanDelayRecord[]> {
+  const database = await initDB();
+  return database.getAll('planDelayRecords');
+}
+
+export async function getPlanDelayRecordsByPlan(planId: string): Promise<PlanDelayRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('planDelayRecords', 'by-plan', planId);
+}
+
+export async function getPlanDelayRecordsByIssue(issueId: string): Promise<PlanDelayRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('planDelayRecords', 'by-issue', issueId);
+}
+
+export async function getPlanDelayRecordsByStatus(status: string): Promise<PlanDelayRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('planDelayRecords', 'by-status', status);
+}
+
+export async function addPlanDelayRecord(record: PlanDelayRecord): Promise<string> {
+  const database = await initDB();
+  return database.add('planDelayRecords', record) as Promise<string>;
+}
+
+export async function updatePlanDelayRecord(record: PlanDelayRecord): Promise<string> {
+  const database = await initDB();
+  return database.put('planDelayRecords', record) as Promise<string>;
+}
+
 export async function clearAllData(): Promise<void> {
   const database = await initDB();
   const tx = database.transaction(
-    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts'],
+    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords'],
     'readwrite'
   );
   await Promise.all([
@@ -371,6 +427,7 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore('migrations').clear(),
     tx.objectStore('reviewPlans').clear(),
     tx.objectStore('planConflicts').clear(),
+    tx.objectStore('planDelayRecords').clear(),
     tx.done,
   ]);
 }

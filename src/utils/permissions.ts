@@ -8,6 +8,7 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'sync:view',
     'history:view',
     'plan:view_own',
+    'plan:delay_request_own',
   ],
   manager: [
     'issue:view_all',
@@ -20,6 +21,8 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan:view_store',
     'plan_conflict:resolve_own',
     'handover:export_own',
+    'plan:delay_request_store',
+    'plan:delay_approve_store',
   ],
   supervisor: [
     'issue:view_all',
@@ -36,6 +39,9 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan_conflict:resolve_all',
     'handover:export_all',
     'handover:import',
+    'plan:delay_request_all',
+    'plan:delay_approve_all',
+    'plan:time_conflict_resolve_all',
   ]
 };
 
@@ -120,4 +126,33 @@ export function canExportHandover(user: User | null | undefined, issue: Issue | 
 
 export function canImportHandover(user: User | null | undefined): boolean {
   return hasPermission(user?.role, 'handover:import');
+}
+
+export function canRequestDelay(user: User | null | undefined, plan: ReviewPlan | undefined, issue?: Issue): boolean {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan:delay_request_all')) return true;
+  if (hasPermission(user.role, 'plan:delay_request_store') && issue && user.storeId === issue.storeId) return true;
+  if (hasPermission(user.role, 'plan:delay_request_own') &&
+      (plan.assigneeId === user.id || plan.creatorId === user.id)) return true;
+  return false;
+}
+
+export function canApproveDelay(user: User | null | undefined, plan: ReviewPlan | undefined, issue?: Issue): boolean {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan:delay_approve_all')) return true;
+  if (hasPermission(user.role, 'plan:delay_approve_store') && issue && user.storeId === issue.storeId) {
+    return true;
+  }
+  return false;
+}
+
+export function canDirectlyChangeReviewTime(user: User | null | undefined, plan: ReviewPlan | undefined, issue?: Issue): boolean {
+  if (!user || !plan) return false;
+  return canEditPlan(user, plan, issue);
+}
+
+export function canResolveTimeConflict(user: User | null | undefined, plan: ReviewPlan | undefined, issue?: Issue): boolean {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan:time_conflict_resolve_all')) return true;
+  return canEditPlan(user, plan, issue);
 }

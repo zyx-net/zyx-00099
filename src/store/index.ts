@@ -5,14 +5,15 @@ import {
   FieldMapping, MigrationRecord, ImportValidationResult, TemplateDiff,
   ReviewPlan, PlanConflict, PlanAttachment, PlanSyncStatus, PlanHistoryDetail,
   SyncEntityType, HandoverValidationResult, HandoverPackage,
+  PlanDelayRecord, PlanDueStatus,
 } from '@/types';
 import * as db from '@/lib/db';
-import { generateId } from '@/utils/helpers';
+import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName } from '@/utils/helpers';
 import {
   syncToServer, createConflict, createSyncQueueItem,
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields,
   syncPlanToServer, createPlanConflict, createPlanSyncQueueItem,
-  diffReviewPlans, mergeReviewPlans,
+  diffReviewPlans, mergeReviewPlans, detectTimeConflict, mergePlanRemark,
   buildHandoverPackage, downloadHandoverPackage, validateHandoverImport,
   applyHandoverResolution, isHandoverPackage,
 } from '@/services/syncService';
@@ -20,6 +21,7 @@ import {
   canManageIssue, canUpgradeTemplate, hasPermission,
   canCreatePlan, canEditPlan, canViewPlan, canResolvePlanConflict,
   canExportHandover, canImportHandover,
+  canRequestDelay, canApproveDelay, canDirectlyChangeReviewTime, canResolveTimeConflict,
 } from '@/utils/permissions';
 import {
   diffTemplateVersions,
@@ -49,6 +51,7 @@ interface AppState {
   migrations: MigrationRecord[];
   reviewPlans: ReviewPlan[];
   planConflicts: PlanConflict[];
+  planDelayRecords: PlanDelayRecord[];
   toasts: ToastMessage[];
   isLoading: boolean;
   pendingUpgrades: PendingTemplateUpgrade[];
@@ -98,6 +101,18 @@ interface AppState {
   getReviewPlansForIssue: (issueId: string) => ReviewPlan[];
   getReviewPlansForCurrentUser: () => ReviewPlan[];
 
+  requestPlanDelay: (planId: string, data: {
+    reason: string;
+    newReviewTime: string;
+    attachmentSummary: string;
+    attachmentIds?: string[];
+  }) => Promise<{ success: boolean; error?: string }>;
+  approvePlanDelay: (delayRecordId: string, remark?: string) => Promise<{ success: boolean; error?: string }>;
+  rejectPlanDelay: (delayRecordId: string, remark?: string) => Promise<{ success: boolean; error?: string }>;
+  resolvePlanTimeConflict: (planId: string, resolution: 'local' | 'remote' | 'merge') => Promise<{ success: boolean; error?: string }>;
+  computeAndSyncDueStatus: () => void;
+  getPlanDelayRecordsForCurrentUser: () => PlanDelayRecord[];
+
   exportHandover: (issueId: string) => void;
   previewHandoverImport: (rawData: any) => HandoverValidationResult | null;
   confirmHandoverImport: (resolutions: Record<string, 'keep_local' | 'adopt_import' | 'merge'>) => Promise<{ success: boolean; imported: number; skipped: number }>;
@@ -123,6 +138,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   migrations: [],
   reviewPlans: [],
   planConflicts: [],
+  planDelayRecords: [],
   toasts: [],
   isLoading: false,
   pendingUpgrades: [],
@@ -134,7 +150,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const [
         stores, templates, issues, syncQueue, conflicts, histories, migrations,
-        reviewPlans, planConflicts, currentUser
+        reviewPlans, planConflicts, planDelayRecords, currentUser
       ] = await Promise.all([
         db.getAllStores(),
         db.getAllTemplates(),
@@ -145,6 +161,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         db.getAllMigrations(),
         db.getAllReviewPlans(),
         db.getAllPlanConflicts(),
+        db.getAllPlanDelayRecords(),
         db.getCurrentUser()
       ]);
 
@@ -153,9 +170,22 @@ export const useAppStore = create<AppState>((set, get) => ({
         templateVersion: issue.templateVersion || '1.0',
       }));
 
+      const now = new Date();
+      const normalizedPlans = reviewPlans.map(p => {
+        const base = normalizeReviewPlanDefaults(p as any);
+        const recordsForPlan = planDelayRecords.filter(r => r.planId === p.id);
+        return {
+          ...base,
+          delayRecords: recordsForPlan,
+          pendingDelayRequest: recordsForPlan.find(r => r.status === 'pending'),
+          dueStatus: computePlanDueStatus({ ...base, delayRecords: recordsForPlan } as ReviewPlan, now),
+        };
+      });
+
       set({
         stores, templates, issues: normalizedIssues, syncQueue, conflicts,
-        histories, migrations, reviewPlans, planConflicts, currentUser,
+        histories, migrations, reviewPlans: normalizedPlans, planConflicts,
+        planDelayRecords, currentUser,
         isLoading: false
       });
 
@@ -357,7 +387,23 @@ export const useAppStore = create<AppState>((set, get) => ({
       warnings.push(`已恢复 ${pcImported} 条复查计划冲突记录`);
     }
 
-    const [stores, templates, issues, conflicts, migrations, reviewPlans, planConflicts] = await Promise.all([
+    const delayRecordsFromPayload = (payload as any).planDelayRecords;
+    if (Array.isArray(delayRecordsFromPayload) && delayRecordsFromPayload.length > 0) {
+      const existingDelayIds = new Set((await db.getAllPlanDelayRecords()).map(r => r.id));
+      let delayImported = 0;
+      for (const rec of delayRecordsFromPayload) {
+        if (existingDelayIds.has(rec.id)) continue;
+        try {
+          await db.addPlanDelayRecord(rec);
+          delayImported++;
+        } catch (e) {
+          warnings.push(`[延期记录] 跳过 ${rec.id}：${(e as any)?.message || '已存在'}`);
+        }
+      }
+      warnings.push(`已恢复 ${delayImported} 条延期申请/审批记录`);
+    }
+
+    const [stores, templates, issues, conflicts, migrations, reviewPlans, planConflicts, planDelayRecords] = await Promise.all([
       db.getAllStores(),
       db.getAllTemplates(),
       db.getAllIssues(),
@@ -365,8 +411,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       db.getAllMigrations(),
       db.getAllReviewPlans(),
       db.getAllPlanConflicts(),
+      db.getAllPlanDelayRecords(),
     ]);
-    set({ stores, templates, issues, conflicts, migrations, reviewPlans, planConflicts });
+
+    const delayByPlan = new Map<string, PlanDelayRecord[]>();
+    for (const rec of planDelayRecords) {
+      const arr = delayByPlan.get(rec.planId) || [];
+      arr.push(rec);
+      delayByPlan.set(rec.planId, arr);
+    }
+
+    const finalPlans = reviewPlans.map(p => {
+      const recs = delayByPlan.get(p.id) || (p as any).delayRecords || [];
+      return {
+        ...p,
+        delayRecords: recs,
+        pendingDelayRequest: recs.find(r => r.status === 'pending'),
+        dueStatus: computePlanDueStatus({ ...p, delayRecords: recs } as ReviewPlan),
+      };
+    });
+
+    set({ stores, templates, issues, conflicts, migrations, reviewPlans: finalPlans, planConflicts, planDelayRecords });
 
     for (const w of warnings) get().addToast('info', w);
     for (const e of errors) get().addToast('error', e);
@@ -987,7 +1052,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!data.assigneeId) return { success: false, error: '请指定复查责任人' };
 
     const now = new Date().toISOString();
-    const plan: ReviewPlan = {
+    const basePlan = {
       id: generateId(),
       issueId: data.issueId,
       reviewTime: data.reviewTime,
@@ -1004,6 +1069,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       createdAt: now,
       updatedAt: now,
     };
+    const plan: ReviewPlan = normalizeReviewPlanDefaults(basePlan as any);
 
     await db.addReviewPlan(plan);
 
@@ -1251,6 +1317,415 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
+  requestPlanDelay: async (planId, data) => {
+    const { currentUser, reviewPlans, issues, planDelayRecords: existingRecords } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const plan = reviewPlans.find(p => p.id === planId);
+    if (!plan) return { success: false, error: '复查计划不存在' };
+
+    const issue = issues.find(i => i.id === plan.issueId);
+    if (!canRequestDelay(currentUser, plan, issue)) {
+      return { success: false, error: '无权为该计划申请延期' };
+    }
+
+    const hasPending = existingRecords.some(
+      r => r.planId === planId && r.status === 'pending'
+    );
+    if (hasPending) {
+      return { success: false, error: '该计划已有待审批的延期申请，请勿重复提交' };
+    }
+
+    if (!data.reason || data.reason.trim() === '') {
+      return { success: false, error: '请填写延期原因' };
+    }
+    if (!data.newReviewTime) {
+      return { success: false, error: '请选择新的复查时间' };
+    }
+    const newTime = new Date(data.newReviewTime);
+    const oldTime = new Date(plan.reviewTime);
+    if (newTime.getTime() <= oldTime.getTime()) {
+      return { success: false, error: '新的复查时间必须晚于原复查时间' };
+    }
+
+    const now = new Date().toISOString();
+    const record: PlanDelayRecord = {
+      id: generateId(),
+      planId,
+      issueId: plan.issueId,
+      reason: data.reason.trim(),
+      newReviewTime: data.newReviewTime,
+      oldReviewTime: plan.reviewTime,
+      attachmentSummary: data.attachmentSummary || '',
+      attachmentIds: data.attachmentIds || [],
+      requesterId: currentUser.id,
+      requesterRole: currentUser.role,
+      requesterName: currentUser.name,
+      status: 'pending',
+      requestedAt: now,
+    };
+
+    await db.addPlanDelayRecord(record);
+
+    const history: History = {
+      id: generateId(),
+      issueId: plan.issueId,
+      action: 'plan_delay_request',
+      operatorId: currentUser.id,
+      operatorRole: currentUser.role,
+      timestamp: now,
+      planId,
+      remark: buildDelayHistoryRemark(record, 'request'),
+      planDetail: {
+        delayRecord: record,
+        field: 'delay_request',
+        newValue: `${data.newReviewTime}（原时间：${plan.reviewTime}）`,
+      },
+    };
+    await db.addHistory(history);
+
+    const allDelayRecords = await db.getAllPlanDelayRecords();
+    const recordsForPlan = allDelayRecords.filter(r => r.planId === planId);
+    const updatedPlan: ReviewPlan = {
+      ...plan,
+      version: plan.version + 1,
+      updatedAt: now,
+      synced: false,
+      pendingDelayRequest: recordsForPlan.find(r => r.status === 'pending'),
+      delayRecords: recordsForPlan,
+      dueStatus: 'delay_requested',
+    };
+    await db.updateReviewPlan(updatedPlan);
+    await get().addPlanToSyncQueue(updatedPlan, 'update');
+
+    const [allPlans, allHistories, allDelay, syncQueue] = await Promise.all([
+      db.getAllReviewPlans(),
+      db.getAllHistories(),
+      db.getAllPlanDelayRecords(),
+      db.getAllSyncQueue(),
+    ]);
+    const finalPlans = allPlans.map(p => ({
+      ...p,
+      delayRecords: allDelay.filter(r => r.planId === p.id),
+      pendingDelayRequest: allDelay.filter(r => r.planId === p.id).find(r => r.status === 'pending'),
+      dueStatus: computePlanDueStatus(p as ReviewPlan),
+    }));
+    set({
+      reviewPlans: finalPlans,
+      histories: allHistories,
+      planDelayRecords: allDelay,
+      syncQueue,
+    });
+
+    get().addToast('success', '延期申请已提交，等待审批');
+    return { success: true };
+  },
+
+  approvePlanDelay: async (delayRecordId, remark) => {
+    const { currentUser, planDelayRecords, reviewPlans, issues } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const record = planDelayRecords.find(r => r.id === delayRecordId);
+    if (!record) return { success: false, error: '延期申请记录不存在' };
+    if (record.status !== 'pending') {
+      return { success: false, error: '该申请已处理，无法重复审批' };
+    }
+
+    const plan = reviewPlans.find(p => p.id === record.planId);
+    if (!plan) return { success: false, error: '关联的复查计划不存在' };
+
+    const issue = issues.find(i => i.id === plan.issueId);
+    if (!canApproveDelay(currentUser, plan, issue)) {
+      if (currentUser.role === 'manager') {
+        const planStore = issues.find(i => i.id === plan.issueId)?.storeId;
+        return {
+          success: false,
+          error: `无权审批该延期申请：此申请属于其他门店`,
+        };
+      }
+      return { success: false, error: '无权审批延期申请，仅店长（本店）和督导可操作' };
+    }
+
+    const now = new Date().toISOString();
+    const approvedRecord: PlanDelayRecord = {
+      ...record,
+      status: 'approved',
+      approverId: currentUser.id,
+      approverRole: currentUser.role,
+      approverName: currentUser.name,
+      approvalRemark: remark,
+      approvedAt: now,
+    };
+
+    await db.updatePlanDelayRecord(approvedRecord);
+
+    const allDelayForPlan = (await db.getAllPlanDelayRecords()).filter(r => r.planId === plan.id);
+    const approvedCount = allDelayForPlan.filter(r => r.status === 'approved').length;
+
+    const updatedPlan: ReviewPlan = {
+      ...plan,
+      version: plan.version + 1,
+      reviewTime: record.newReviewTime,
+      delayCount: approvedCount,
+      delayRecords: allDelayForPlan,
+      pendingDelayRequest: undefined,
+      lastDelayReason: record.reason,
+      lastApproverId: currentUser.id,
+      lastApproverName: currentUser.name,
+      updatedAt: now,
+      synced: false,
+      dueStatus: 'delay_approved',
+      hasTimeConflict: false,
+      timeConflictInfo: undefined,
+    };
+    await db.updateReviewPlan(updatedPlan);
+    await get().addPlanToSyncQueue(updatedPlan, 'update');
+
+    const history: History = {
+      id: generateId(),
+      issueId: plan.issueId,
+      action: 'plan_delay_approve',
+      operatorId: currentUser.id,
+      operatorRole: currentUser.role,
+      timestamp: now,
+      planId: plan.id,
+      remark: buildDelayHistoryRemark(approvedRecord, 'approve'),
+      planDetail: {
+        delayRecord: approvedRecord,
+        field: 'delay_approve',
+        oldValue: record.oldReviewTime,
+        newValue: record.newReviewTime,
+      },
+    };
+    await db.addHistory(history);
+
+    const [allPlans, allHistories, allDelay, syncQueue] = await Promise.all([
+      db.getAllReviewPlans(),
+      db.getAllHistories(),
+      db.getAllPlanDelayRecords(),
+      db.getAllSyncQueue(),
+    ]);
+    const finalPlans = allPlans.map(p => ({
+      ...p,
+      delayRecords: allDelay.filter(r => r.planId === p.id),
+      pendingDelayRequest: allDelay.filter(r => r.planId === p.id).find(r => r.status === 'pending'),
+      dueStatus: computePlanDueStatus(p as ReviewPlan),
+    }));
+    set({
+      reviewPlans: finalPlans,
+      histories: allHistories,
+      planDelayRecords: allDelay,
+      syncQueue,
+    });
+
+    get().addToast('success', '延期申请已批准，复查时间已更新');
+    return { success: true };
+  },
+
+  rejectPlanDelay: async (delayRecordId, remark) => {
+    const { currentUser, planDelayRecords, reviewPlans, issues } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const record = planDelayRecords.find(r => r.id === delayRecordId);
+    if (!record) return { success: false, error: '延期申请记录不存在' };
+    if (record.status !== 'pending') {
+      return { success: false, error: '该申请已处理，无法重复审批' };
+    }
+
+    const plan = reviewPlans.find(p => p.id === record.planId);
+    if (!plan) return { success: false, error: '关联的复查计划不存在' };
+
+    const issue = issues.find(i => i.id === plan.issueId);
+    if (!canApproveDelay(currentUser, plan, issue)) {
+      return { success: false, error: '无权驳回该延期申请' };
+    }
+
+    const now = new Date().toISOString();
+    const rejectedRecord: PlanDelayRecord = {
+      ...record,
+      status: 'rejected',
+      approverId: currentUser.id,
+      approverRole: currentUser.role,
+      approverName: currentUser.name,
+      approvalRemark: remark,
+      rejectedAt: now,
+    };
+
+    await db.updatePlanDelayRecord(rejectedRecord);
+
+    const allDelayForPlan = (await db.getAllPlanDelayRecords()).filter(r => r.planId === plan.id);
+
+    const updatedPlan: ReviewPlan = {
+      ...plan,
+      version: plan.version + 1,
+      delayRecords: allDelayForPlan,
+      pendingDelayRequest: undefined,
+      updatedAt: now,
+      synced: false,
+      dueStatus: 'delay_rejected',
+    };
+    await db.updateReviewPlan(updatedPlan);
+    await get().addPlanToSyncQueue(updatedPlan, 'update');
+
+    const history: History = {
+      id: generateId(),
+      issueId: plan.issueId,
+      action: 'plan_delay_reject',
+      operatorId: currentUser.id,
+      operatorRole: currentUser.role,
+      timestamp: now,
+      planId: plan.id,
+      remark: buildDelayHistoryRemark(rejectedRecord, 'reject'),
+      planDetail: {
+        delayRecord: rejectedRecord,
+        field: 'delay_reject',
+        oldValue: record.oldReviewTime,
+        newValue: '（延期被驳回，原时间不变）',
+      },
+    };
+    await db.addHistory(history);
+
+    const [allPlans, allHistories, allDelay, syncQueue] = await Promise.all([
+      db.getAllReviewPlans(),
+      db.getAllHistories(),
+      db.getAllPlanDelayRecords(),
+      db.getAllSyncQueue(),
+    ]);
+    const finalPlans = allPlans.map(p => ({
+      ...p,
+      delayRecords: allDelay.filter(r => r.planId === p.id),
+      pendingDelayRequest: allDelay.filter(r => r.planId === p.id).find(r => r.status === 'pending'),
+      dueStatus: computePlanDueStatus(p as ReviewPlan),
+    }));
+    set({
+      reviewPlans: finalPlans,
+      histories: allHistories,
+      planDelayRecords: allDelay,
+      syncQueue,
+    });
+
+    get().addToast('warning', `延期申请已驳回${remark ? `：${remark}` : ''}`);
+    return { success: true };
+  },
+
+  resolvePlanTimeConflict: async (planId, resolution) => {
+    const { currentUser, reviewPlans, planConflicts, issues } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const plan = reviewPlans.find(p => p.id === planId);
+    if (!plan) return { success: false, error: '复查计划不存在' };
+
+    const issue = issues.find(i => i.id === plan.issueId);
+    if (!canResolveTimeConflict(currentUser, plan, issue)) {
+      return { success: false, error: '无权解决该计划的时间冲突' };
+    }
+    if (!plan.hasTimeConflict || !plan.timeConflictInfo) {
+      return { success: false, error: '该计划没有时间冲突需要解决' };
+    }
+
+    const now = new Date().toISOString();
+    const { localReviewTime, remoteReviewTime } = plan.timeConflictInfo;
+
+    let finalReviewTime = plan.reviewTime;
+    let mergedRemark = plan.rectificationNote;
+
+    if (resolution === 'local') {
+      finalReviewTime = localReviewTime;
+    } else if (resolution === 'remote') {
+      finalReviewTime = remoteReviewTime;
+    } else {
+      const planConflict = planConflicts.find(pc => pc.planId === planId && pc.status === 'pending');
+      if (planConflict) {
+        const merged = mergePlanRemark(planConflict.localPlan, planConflict.remotePlan);
+        finalReviewTime = merged.reviewTime;
+        mergedRemark = merged.rectificationNote;
+      } else {
+        finalReviewTime = remoteReviewTime;
+      }
+    }
+
+    const updatedPlan: ReviewPlan = {
+      ...plan,
+      version: plan.version + 1,
+      reviewTime: finalReviewTime,
+      rectificationNote: mergedRemark,
+      hasTimeConflict: false,
+      timeConflictInfo: undefined,
+      updatedAt: now,
+      synced: false,
+      dueStatus: computePlanDueStatus({ ...plan, reviewTime: finalReviewTime } as ReviewPlan),
+    };
+
+    await db.updateReviewPlan(updatedPlan);
+    await get().addPlanToSyncQueue(updatedPlan, 'update');
+
+    const history: History = {
+      id: generateId(),
+      issueId: plan.issueId,
+      action: 'plan_time_conflict_resolve',
+      operatorId: currentUser.id,
+      operatorRole: currentUser.role,
+      timestamp: now,
+      planId: plan.id,
+      remark: `解决时间冲突，采用：${resolution === 'local' ? '本地时间' : resolution === 'remote' ? '远端时间' : '合并备注（采用远端时间）'}。本地 ${localReviewTime} vs 远端 ${remoteReviewTime}，最终：${finalReviewTime}`,
+      planDetail: {
+        timeConflict: {
+          resolution,
+          localReviewTime,
+          remoteReviewTime,
+          mergedRemark: resolution === 'merge' ? mergedRemark : undefined,
+        },
+      },
+    };
+    await db.addHistory(history);
+
+    const [allPlans, allHistories, syncQueue] = await Promise.all([
+      db.getAllReviewPlans(),
+      db.getAllHistories(),
+      db.getAllSyncQueue(),
+    ]);
+    const allDelay = await db.getAllPlanDelayRecords();
+    const finalPlans = allPlans.map(p => ({
+      ...p,
+      delayRecords: allDelay.filter(r => r.planId === p.id),
+      pendingDelayRequest: allDelay.filter(r => r.planId === p.id).find(r => r.status === 'pending'),
+      dueStatus: computePlanDueStatus(p as ReviewPlan),
+    }));
+    set({
+      reviewPlans: finalPlans,
+      histories: allHistories,
+      syncQueue,
+    });
+
+    const labels = { local: '本地时间', remote: '远端时间', merge: '合并备注' };
+    get().addToast('success', `时间冲突已解决，采用${labels[resolution]}`);
+    return { success: true };
+  },
+
+  computeAndSyncDueStatus: () => {
+    const now = new Date();
+    set(state => ({
+      reviewPlans: state.reviewPlans.map(p => ({
+        ...p,
+        dueStatus: computePlanDueStatus(p, now),
+      })),
+    }));
+  },
+
+  getPlanDelayRecordsForCurrentUser: () => {
+    const { planDelayRecords, currentUser, issues, reviewPlans } = get();
+    if (!currentUser) return [];
+    return planDelayRecords.filter(r => {
+      if (currentUser.role === 'supervisor') return true;
+      if (r.requesterId === currentUser.id) return true;
+      const plan = reviewPlans.find(p => p.id === r.planId);
+      const issue = issues.find(i => i.id === r.issueId);
+      if (currentUser.role === 'manager' && issue && issue.storeId === currentUser.storeId) return true;
+      if (plan && (plan.assigneeId === currentUser.id || plan.creatorId === currentUser.id)) return true;
+      return false;
+    });
+  },
+
   exportHandover: (issueId) => {
     const { issues, reviewPlans, planConflicts, histories, currentUser, stores, addToast } = get();
     const issue = issues.find(i => i.id === issueId);
@@ -1434,7 +1909,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   exportData: (format) => {
-    const { issues, stores, templates, migrations, conflicts, currentUser, reviewPlans, planConflicts } = get();
+    const { issues, stores, templates, migrations, conflicts, currentUser, reviewPlans, planConflicts, planDelayRecords } = get();
     const timestamp = new Date().toISOString().slice(0, 10);
     const unresolvedConflicts = conflicts.filter(c => c.status === 'pending');
     const unresolvedPlanConflicts = planConflicts.filter(c => c.status === 'pending');
@@ -1448,6 +1923,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         unresolvedConflicts,
         reviewPlans,
         unresolvedPlanConflicts,
+        planDelayRecords,
         exportedAt: new Date().toISOString(),
         exportedBy: currentUser,
       };
