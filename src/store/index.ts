@@ -9,6 +9,7 @@ import {
   syncToServer, createConflict, createSyncQueueItem,
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields
 } from '@/services/syncService';
+import { canManageIssue } from '@/utils/permissions';
 
 interface AppState {
   currentUser: User | null;
@@ -36,6 +37,7 @@ interface AppState {
 
   addToSyncQueue: (issue: Issue, action: 'create' | 'update' | 'delete') => Promise<void>;
   processSyncQueue: (simulateConflict?: boolean) => Promise<void>;
+  forceConflictSync: () => Promise<void>;
   retrySyncItem: (itemId: string) => Promise<void>;
   clearCompletedSync: () => Promise<void>;
 
@@ -217,15 +219,27 @@ export const useAppStore = create<AppState>((set, get) => ({
     const issue = get().issues.find(i => i.id === id);
     if (!issue) return { success: false, error: '问题不存在' };
 
-    const { currentUser } = get();
+    const { currentUser, stores } = get();
     if (!currentUser) return { success: false, error: '请先选择身份' };
 
-    if (status === 'closed' && currentUser.role !== 'manager' && currentUser.role !== 'supervisor') {
-      return { success: false, error: '无权关闭问题，仅店长和督导可操作' };
+    if (status === 'closed') {
+      if (!canManageIssue(currentUser, issue, 'close')) {
+        const store = stores.find(s => s.id === issue.storeId);
+        const userStore = stores.find(s => s.id === currentUser.storeId);
+        if (currentUser.role === 'manager') {
+          return {
+            success: false,
+            error: `无权关闭问题：该问题属于「${store?.name || issue.storeId}」，您仅可关闭「${userStore?.name || '未知门店'}」的问题`
+          };
+        }
+        return { success: false, error: '无权关闭问题，仅店长和督导可操作' };
+      }
     }
 
-    if (status === 'rejected' && currentUser.role !== 'supervisor') {
-      return { success: false, error: '无权驳回问题，仅督导可操作' };
+    if (status === 'rejected') {
+      if (!canManageIssue(currentUser, issue, 'reject')) {
+        return { success: false, error: '无权驳回问题，仅督导可操作' };
+      }
     }
 
     const now = new Date().toISOString();
@@ -350,6 +364,57 @@ export const useAppStore = create<AppState>((set, get) => ({
     const syncQueue = await db.getAllSyncQueue();
     set({ syncQueue });
     get().processSyncQueue();
+  },
+
+  forceConflictSync: async () => {
+    const { syncQueue: currentSyncQueue, isOnline } = get();
+    if (!isOnline) {
+      get().addToast('warning', '当前离线，无法同步');
+      return;
+    }
+
+    const pendingItems = currentSyncQueue.filter(i => i.status === 'pending' || i.status === 'failed');
+    if (pendingItems.length === 0) {
+      get().addToast('info', '没有待同步的项目');
+      return;
+    }
+
+    for (const item of pendingItems) {
+      await db.updateSyncQueueItem({ ...item, status: 'syncing', lastAttempt: new Date().toISOString() });
+      set({ syncQueue: (await db.getAllSyncQueue()) });
+
+      const result = await syncToServer(item.payload, true);
+
+      if (result.conflict && result.remoteVersion) {
+        const existingConflict = get().conflicts.find(
+          c => c.issueId === item.issueId && c.status === 'pending'
+        );
+        if (!existingConflict) {
+          const conflict = createConflict(item.payload, result.remoteVersion);
+          await db.addConflict(conflict);
+        }
+        await db.updateSyncQueueItem({
+          ...item,
+          status: 'failed',
+          retryCount: item.retryCount + 1,
+          errorMessage: '版本冲突：本地与远程内容不一致，需人工处理'
+        });
+      }
+    }
+
+    const [issues, updatedSyncQueue, conflicts] = await Promise.all([
+      db.getAllIssues(),
+      db.getAllSyncQueue(),
+      db.getAllConflicts()
+    ]);
+    set({ issues, syncQueue: updatedSyncQueue, conflicts });
+
+    const conflictCount = updatedSyncQueue.filter(
+      i => i.status === 'failed' && i.errorMessage?.includes('冲突')
+    ).length;
+    if (conflictCount > 0) {
+      get().addToast('error', `${conflictCount} 项同步冲突，请到问题详情或冲突列表处理`);
+    }
   },
 
   clearCompletedSync: async () => {

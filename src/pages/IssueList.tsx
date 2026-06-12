@@ -24,6 +24,7 @@ export default function IssueList() {
   const filteredIssues = useMemo(() => {
     return issues.filter(issue => {
       if (!canViewAll && issue.creatorId !== currentUser?.id) return false;
+      if (currentUser?.role === 'manager' && currentUser.storeId && issue.storeId !== currentUser.storeId) return false;
       if (statusFilter !== 'all' && issue.status !== statusFilter) return false;
       if (storeFilter !== 'all' && issue.storeId !== storeFilter) return false;
       if (searchQuery) {
@@ -33,7 +34,7 @@ export default function IssueList() {
       }
       return true;
     }).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-  }, [issues, statusFilter, storeFilter, searchQuery, canViewAll, currentUser?.id]);
+  }, [issues, statusFilter, storeFilter, searchQuery, canViewAll, currentUser?.id, currentUser?.role, currentUser?.storeId]);
 
   return (
     <div className="space-y-6">

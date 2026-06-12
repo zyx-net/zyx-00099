@@ -4,6 +4,7 @@ export interface User {
   id: string;
   role: UserRole;
   name: string;
+  storeId?: string;
 }
 
 export interface Store {

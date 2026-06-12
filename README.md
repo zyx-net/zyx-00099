@@ -1,57 +1,168 @@
-# React + TypeScript + Vite
+# 巡店问题采集 PWA
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+本地优先的巡店问题采集 Progressive Web App，支持离线创建问题、多角色权限管理、同步队列、版本冲突处理。
 
-Currently, two official plugins are available:
+## 功能特性
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+- **三类身份**：巡检员、店长、督导，不同角色有不同操作权限
+- **门店归属**：店长只能查看和关闭自己门店的问题，督导可跨门店操作
+- **本地优先**：所有操作先写入 IndexedDB，联网后自动同步
+- **离线支持**：离线创建/编辑问题，恢复网络后同步到服务器
+- **冲突处理**：同步时检测版本冲突，保留本地和远端双方内容，人工介入处理
+- **同步队列**：可视化查看待同步、同步中、失败、已完成状态
+- **操作历史**：完整记录问题的每一次状态变更
+- **数据导出**：支持 JSON 和 CSV 格式导出
+- **PWA**：支持安装到桌面，离线可用
 
-## Expanding the ESLint configuration
+## 角色权限矩阵
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+| 功能 | 巡检员 | 店长 | 督导 |
+|------|--------|------|------|
+| 创建问题 | ✅ | ❌ | ✅ |
+| 编辑自己的草稿 | ✅ | ❌ | ❌ |
+| 查看自己的问题 | ✅ | ❌ | ❌ |
+| 查看所有问题 | ❌ | ✅（仅限本门店） | ✅ |
+| 关闭问题 | ❌ | ✅（仅限本门店） | ✅ |
+| 驳回问题 | ❌ | ❌ | ✅ |
+| 导入模板/门店 | ❌ | ❌ | ✅ |
+| 管理同步 | ❌ | ❌ | ✅ |
+| 解决冲突 | ❌ | ❌ | ✅ |
+| 导出数据 | ❌ | ✅ | ✅ |
 
-```js
-export default tseslint.config({
-  extends: [
-    // Remove ...tseslint.configs.recommended and replace with this
-    ...tseslint.configs.recommendedTypeChecked,
-    // Alternatively, use this for stricter rules
-    ...tseslint.configs.strictTypeChecked,
-    // Optionally, add this for stylistic rules
-    ...tseslint.configs.stylisticTypeChecked,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+## 快速开始
+
+### 安装依赖
+
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### 开发模式
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default tseslint.config({
-  extends: [
-    // other configs...
-    // Enable lint rules for React
-    reactX.configs['recommended-typescript'],
-    // Enable lint rules for React DOM
-    reactDom.configs.recommended,
-  ],
-  languageOptions: {
-    // other options...
-    parserOptions: {
-      project: ['./tsconfig.node.json', './tsconfig.app.json'],
-      tsconfigRootDir: import.meta.dirname,
-    },
-  },
-})
+```bash
+npm run dev
 ```
+
+访问 http://localhost:5173 查看应用。
+
+### 类型检查
+
+```bash
+npm run check
+```
+
+### 构建生产版本
+
+```bash
+npm run build
+```
+
+### 预览生产构建
+
+```bash
+npm run preview
+```
+
+## 回归验证
+
+### 自动化验证脚本
+
+运行核心逻辑验证（门店归属权限、冲突处理、列表过滤）：
+
+```bash
+npm run verify
+```
+
+覆盖场景：
+
+1. ✅ 店长可关闭自己门店的问题
+2. ✅ 店长不可关闭其他门店的问题
+3. ✅ 督导可关闭任意门店的问题
+4. ✅ 巡检员不能关闭任何问题
+5. ✅ 只有督导可驳回问题
+6. ✅ 用户或问题为空时权限校验返回 false
+7. ✅ 模拟同步冲突返回冲突标记和远端版本
+8. ✅ 冲突保留本地和远端两份完整内容
+9. ✅ 非冲突场景同步成功
+10. ✅ 店长只能看到自己门店的问题
+11. ✅ 督导可看到所有问题
+
+### 手动验证流程
+
+#### 场景 1：同门店关闭成功
+
+1. 进入首页，选择「巡检员」身份
+2. 点击「新建问题」，创建一条属于门店A的问题并提交
+3. 点击右上角切换到离线模式
+4. 返回首页，选择「店长」身份（店长默认绑定第一家门店）
+5. 进入问题列表，点击刚才创建的问题
+6. 点击「关闭问题」，确认问题状态变为「已关闭」
+7. 查看操作历史，确认有「关闭」记录
+8. 进入同步队列，确认有一条待同步记录
+
+#### 场景 2：跨门店关闭失败
+
+1. 以「督导」身份进入，导入配置或创建多个门店
+2. 以「巡检员」身份创建两条问题，分别属于不同门店
+3. 以「店长」身份进入，确认只能看到本门店的问题
+4. 如果通过 URL 直接访问其他门店问题详情，「关闭问题」按钮应不可见或不可点击
+5. 强制调用关闭接口（可用浏览器控制台测试），应返回明确的错误提示，包含问题所属门店和用户所属门店信息
+6. 确认问题状态未改变，操作历史无新增记录，同步队列无新增项
+
+#### 场景 3：督导关闭成功
+
+1. 以「督导」身份进入
+2. 查看任意门店的问题，确认都能看到「关闭」按钮
+3. 关闭任意门店的问题，确认操作成功
+4. 操作历史和同步队列都有对应记录
+
+#### 场景 4：冲突保留双方版本
+
+1. 以「巡检员」身份离线创建一条问题并提交
+2. 保持离线，编辑该问题的标题或内容
+3. 切换到在线模式，进入「同步队列」页面
+4. 点击「模拟冲突」按钮（强制所有待同步项触发冲突）
+5. 确认：
+   - 同步队列中该项目变为「失败」状态，显示「版本冲突」错误信息
+   - 问题详情页显示「版本冲突」提示卡，展示本地和远端两个版本的对比
+   - 操作历史页有「存在冲突」红色标记
+   - 顶部 Toast 提示冲突数量
+6. 以「督导」身份进入问题详情，可选择：
+   - 保留本地版本
+   - 采用远程版本
+   - 合并双方内容
+
+## 技术栈
+
+- **框架**：React 18 + TypeScript
+- **构建**：Vite
+- **状态管理**：Zustand
+- **本地存储**：IndexedDB (idb 库)
+- **样式**：TailwindCSS 3
+- **路由**：React Router DOM
+- **图标**：Lucide React
+- **PWA**：vite-plugin-pwa
+
+## 项目结构
+
+```
+src/
+├── components/       # 通用组件
+├── lib/             # 基础设施（数据库、工具函数）
+├── pages/           # 页面组件
+├── services/        # 业务服务（同步服务）
+├── store/           # 全局状态管理
+├── types/           # TypeScript 类型定义
+├── utils/           # 工具函数（权限、辅助函数）
+└── main.tsx         # 入口文件
+```
+
+## 核心数据模型
+
+- **User**：用户，含 role 角色和 storeId 门店归属
+- **Store**：门店，id / name / address
+- **Template**：检查模板，分类和检查项
+- **Issue**：问题，含状态、版本号、门店关联
+- **History**：操作历史，记录每次状态变更
+- **Conflict**：版本冲突，保留本地和远端版本
+- **SyncQueueItem**：同步队列项，含状态和错误信息

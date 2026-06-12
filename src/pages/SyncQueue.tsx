@@ -4,12 +4,12 @@ import { formatDate } from '@/utils/helpers';
 import { hasPermission } from '@/utils/permissions';
 import {
   RefreshCw, Trash2, AlertCircle, CheckCircle, Clock, XCircle,
-  Play, TrendingUp
+  Play, TrendingUp, AlertTriangle
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export default function SyncQueue() {
-  const { syncQueue, issues, currentUser, isOnline, processSyncQueue, retrySyncItem, clearCompletedSync } = useAppStore();
+  const { syncQueue, issues, currentUser, isOnline, processSyncQueue, forceConflictSync, retrySyncItem, clearCompletedSync } = useAppStore();
 
   const canManage = currentUser && hasPermission(currentUser.role, 'sync:manage');
 
@@ -70,6 +70,15 @@ export default function SyncQueue() {
           >
             <Play size={16} />
             同步全部
+          </button>
+          <button
+            onClick={() => forceConflictSync()}
+            disabled={!isOnline || (pendingItems.length === 0 && failedItems.length === 0)}
+            className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            title="强制触发所有待同步项的版本冲突，用于验证冲突处理流程"
+          >
+            <AlertTriangle size={16} />
+            模拟冲突
           </button>
         </div>
       </div>

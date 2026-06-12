@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/store';
 import { IssueStatus, Issue } from '@/types';
-import { hasPermission } from '@/utils/permissions';
+import { hasPermission, canManageIssue } from '@/utils/permissions';
 import { IssueStatusBadge, PriorityBadge } from '@/components/StatusBadge';
 import { formatDate, ACTION_LABELS, getRoleName } from '@/utils/helpers';
 import {
@@ -59,9 +59,9 @@ export default function IssueDetail() {
 
   const canEdit = currentUser && hasPermission(currentUser.role, 'issue:edit_own') &&
     issue.creatorId === currentUser.id && issue.status === 'draft';
-  const canClose = currentUser && hasPermission(currentUser.role, 'issue:close') &&
+  const canClose = currentUser && issue && canManageIssue(currentUser, issue, 'close') &&
     (issue.status === 'submitted' || issue.status === 'rejected');
-  const canReject = currentUser && hasPermission(currentUser.role, 'issue:reject') &&
+  const canReject = currentUser && issue && canManageIssue(currentUser, issue, 'reject') &&
     issue.status === 'submitted';
   const canSubmit = currentUser && issue.creatorId === currentUser.id && issue.status === 'draft';
   const canResolveConflict = currentUser && hasPermission(currentUser.role, 'conflict:resolve');

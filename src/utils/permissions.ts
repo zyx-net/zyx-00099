@@ -1,4 +1,4 @@
-import { UserRole } from '@/types';
+import { UserRole, User, Issue } from '@/types';
 
 export const PERMISSIONS: Record<UserRole, string[]> = {
   inspector: [
@@ -42,3 +42,18 @@ export const ROLE_DESCRIPTIONS: Record<UserRole, string> = {
   manager: '查看门店问题，核实后关闭问题，导出记录',
   supervisor: '导入配置，驳回问题，解决冲突，管理同步'
 };
+
+export function canManageIssue(user: User | null | undefined, issue: Issue | undefined, action: 'close' | 'reject'): boolean {
+  if (!user || !issue) return false;
+
+  if (action === 'close' && !hasPermission(user.role, 'issue:close')) return false;
+  if (action === 'reject' && !hasPermission(user.role, 'issue:reject')) return false;
+
+  if (user.role === 'supervisor') return true;
+
+  if (user.role === 'manager') {
+    return user.storeId === issue.storeId;
+  }
+
+  return false;
+}

@@ -22,6 +22,9 @@ export default function Login() {
       role,
       name: ROLE_LABELS[role]
     };
+    if (role === 'manager' && stores.length > 0) {
+      user.storeId = stores[0].id;
+    }
     setCurrentUser(user);
     navigate('/issues');
   };
