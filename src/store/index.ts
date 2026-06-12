@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import {
   User, Issue, Store, Template, History, Conflict, SyncQueueItem,
-  IssueStatus, UserRole, ToastMessage, HistoryAction
+  IssueStatus, UserRole, ToastMessage, HistoryAction, MigrationOption,
+  FieldMapping, MigrationRecord, ImportValidationResult, TemplateDiff,
 } from '@/types';
 import * as db from '@/lib/db';
 import { generateId } from '@/utils/helpers';
@@ -9,7 +10,22 @@ import {
   syncToServer, createConflict, createSyncQueueItem,
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields
 } from '@/services/syncService';
-import { canManageIssue } from '@/utils/permissions';
+import { canManageIssue, canUpgradeTemplate, hasPermission } from '@/utils/permissions';
+import {
+  diffTemplateVersions,
+  applyTemplateUpgrade,
+  validateTemplateImport,
+  parseExportPayload,
+  isNewerVersion,
+} from '@/services/templateVersionService';
+
+export interface PendingTemplateUpgrade {
+  existing: Template;
+  incoming: Template;
+  diff: TemplateDiff;
+  selectedOption: MigrationOption;
+  customMappings: FieldMapping[];
+}
 
 interface AppState {
   currentUser: User | null;
@@ -20,8 +36,11 @@ interface AppState {
   syncQueue: SyncQueueItem[];
   conflicts: Conflict[];
   histories: History[];
+  migrations: MigrationRecord[];
   toasts: ToastMessage[];
   isLoading: boolean;
+  pendingUpgrades: PendingTemplateUpgrade[];
+  lastImportValidation: ImportValidationResult | null;
 
   init: () => Promise<void>;
   setCurrentUser: (user: User | null) => void;
@@ -29,9 +48,16 @@ interface AppState {
   toggleOnline: () => void;
 
   importStores: (stores: Store[]) => Promise<void>;
-  importTemplates: (templates: Template[]) => Promise<void>;
+  importTemplates: (templates: Template[]) => Promise<ImportValidationResult>;
+  importBackup: (rawData: any) => Promise<{ success: boolean; warnings: string[]; errors: string[] }>;
 
-  createIssue: (issue: Omit<Issue, 'version' | 'createdAt' | 'updatedAt' | 'synced'> & { id?: string }) => Promise<{ success: boolean; error?: string; issue?: Issue }>;
+  previewTemplateUpgrade: (existingId: string, incoming: Template) => TemplateDiff;
+  setUpgradeOption: (existingId: string, option: MigrationOption) => void;
+  setUpgradeMappings: (existingId: string, mappings: FieldMapping[]) => void;
+  confirmTemplateUpgrades: () => Promise<{ upgraded: number; migrated: number; kept: number }>;
+  cancelPendingUpgrades: () => void;
+
+  createIssue: (issue: Omit<Issue, 'version' | 'createdAt' | 'updatedAt' | 'synced' | 'templateVersion'> & { id?: string; templateVersion?: string }) => Promise<{ success: boolean; error?: string; issue?: Issue }>;
   updateIssue: (id: string, updates: Partial<Issue>) => Promise<void>;
   updateIssueStatus: (id: string, status: IssueStatus, operatorId: string, remark?: string) => Promise<{ success: boolean; error?: string }>;
 
@@ -47,6 +73,8 @@ interface AppState {
   removeToast: (id: string) => void;
 
   exportData: (format: 'json' | 'csv') => void;
+
+  getTemplateForIssue: (issue: Issue) => Template | undefined;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -58,22 +86,32 @@ export const useAppStore = create<AppState>((set, get) => ({
   syncQueue: [],
   conflicts: [],
   histories: [],
+  migrations: [],
   toasts: [],
   isLoading: false,
+  pendingUpgrades: [],
+  lastImportValidation: null,
 
   init: async () => {
     set({ isLoading: true });
     try {
-      const [stores, templates, issues, syncQueue, conflicts, histories, currentUser] = await Promise.all([
+      const [stores, templates, issues, syncQueue, conflicts, histories, migrations, currentUser] = await Promise.all([
         db.getAllStores(),
         db.getAllTemplates(),
         db.getAllIssues(),
         db.getAllSyncQueue(),
         db.getAllConflicts(),
         db.getAllHistories(),
+        db.getAllMigrations(),
         db.getCurrentUser()
       ]);
-      set({ stores, templates, issues, syncQueue, conflicts, histories, currentUser, isLoading: false });
+
+      const normalizedIssues = issues.map(issue => ({
+        ...issue,
+        templateVersion: issue.templateVersion || '1.0',
+      }));
+
+      set({ stores, templates, issues: normalizedIssues, syncQueue, conflicts, histories, migrations, currentUser, isLoading: false });
 
       const handleOnline = () => {
         set({ isOnline: true });
@@ -119,10 +157,248 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   importTemplates: async (templates) => {
-    await db.addTemplates(templates);
+    const { currentUser, templates: existingTemplates } = get();
+
+    const validation = validateTemplateImport(templates, existingTemplates, currentUser?.role || 'inspector');
+    set({ lastImportValidation: validation });
+
+    if (!validation.valid) {
+      for (const err of validation.errors) {
+        get().addToast('error', err);
+      }
+      return validation;
+    }
+
+    for (const warn of validation.warnings) {
+      get().addToast(warn.type === 'permission_denied' ? 'error' : 'warning', warn.message);
+    }
+
+    if (validation.templatesToImport.length > 0) {
+      await db.addTemplates(validation.templatesToImport);
+      get().addToast('success', `成功导入 ${validation.templatesToImport.length} 个新模板`);
+    }
+
+    if (validation.templatesToUpgrade.length > 0) {
+      const pending: PendingTemplateUpgrade[] = [];
+      const { issues: allIssues } = get();
+      for (const { existing, incoming } of validation.templatesToUpgrade) {
+        const affectedIssues = allIssues.filter(
+          i => i.templateId === existing.id && i.templateVersion === existing.version
+        );
+        const diff = diffTemplateVersions(existing, incoming, affectedIssues);
+        pending.push({
+          existing,
+          incoming,
+          diff,
+          selectedOption: 'migrate',
+          customMappings: [],
+        });
+      }
+      set({ pendingUpgrades: pending });
+      get().addToast('warning', `检测到 ${pending.length} 个模板可升级，请在升级确认页面选择迁移策略`);
+    }
+
     const allTemplates = await db.getAllTemplates();
     set({ templates: allTemplates });
-    get().addToast('success', `成功导入 ${templates.length} 个模板`);
+
+    return validation;
+  },
+
+  importBackup: async (rawData) => {
+    const parsed = parseExportPayload(rawData);
+    const warnings = [...parsed.warnings];
+    const errors = [...parsed.errors];
+
+    if (!parsed.valid || !parsed.payload) {
+      for (const err of errors) get().addToast('error', err);
+      return { success: false, warnings, errors };
+    }
+
+    const { payload } = parsed;
+    const { currentUser } = get();
+
+    if (payload.stores?.length) {
+      await db.addStores(payload.stores);
+      warnings.push(`已导入 ${payload.stores.length} 个门店`);
+    }
+
+    const existingTemplates = await db.getAllTemplates();
+    const validation = validateTemplateImport(payload.templates || [], existingTemplates, currentUser?.role || 'inspector');
+    for (const w of validation.warnings) warnings.push(w.message);
+    for (const e of validation.errors) errors.push(e);
+
+    if (validation.templatesToImport.length > 0) {
+      await db.addTemplates(validation.templatesToImport);
+      warnings.push(`已导入 ${validation.templatesToImport.length} 个模板`);
+    }
+    if (validation.templatesToUpgrade.length > 0) {
+      warnings.push(`检测到 ${validation.templatesToUpgrade.length} 个模板升级，需要督导手动确认`);
+    }
+
+    if (payload.migrations?.length) {
+      for (const mig of payload.migrations) {
+        try { await db.addMigration(mig); } catch { /* dedup silently */ }
+      }
+      warnings.push(`已恢复 ${payload.migrations.length} 条迁移记录`);
+    }
+
+    if (payload.issues?.length) {
+      const existingIds = new Set((await db.getAllIssues()).map(i => i.id));
+      let imported = 0, skipped = 0;
+      for (const issue of payload.issues) {
+        if (existingIds.has(issue.id)) {
+          skipped++;
+          warnings.push(`跳过重复问题 ${issue.id}`);
+          continue;
+        }
+        const normalized: Issue = {
+          ...issue,
+          templateVersion: issue.templateVersion || '1.0',
+        };
+        await db.addIssue(normalized);
+        imported++;
+      }
+      warnings.push(`已导入 ${imported} 条问题（跳过 ${skipped} 条重复）`);
+    }
+
+    if (payload.unresolvedConflicts?.length) {
+      const existingIds = new Set((await db.getAllConflicts()).map(c => c.id));
+      let imported = 0;
+      for (const c of payload.unresolvedConflicts) {
+        if (existingIds.has(c.id)) continue;
+        await db.addConflict(c);
+        imported++;
+      }
+      warnings.push(`已恢复 ${imported} 条冲突记录`);
+    }
+
+    const [stores, templates, issues, conflicts, migrations] = await Promise.all([
+      db.getAllStores(),
+      db.getAllTemplates(),
+      db.getAllIssues(),
+      db.getAllConflicts(),
+      db.getAllMigrations(),
+    ]);
+    set({ stores, templates, issues, conflicts, migrations });
+
+    for (const w of warnings) get().addToast('info', w);
+    for (const e of errors) get().addToast('error', e);
+
+    return { success: errors.length === 0, warnings, errors };
+  },
+
+  previewTemplateUpgrade: (existingId, incoming) => {
+    const { templates, issues } = get();
+    const existing = templates.find(t => t.id === existingId);
+    if (!existing) throw new Error('模板不存在');
+    const affectedIssues = issues.filter(
+      i => i.templateId === existing.id && i.templateVersion === existing.version
+    );
+    return diffTemplateVersions(existing, incoming, affectedIssues);
+  },
+
+  setUpgradeOption: (existingId, option) => {
+    set(state => ({
+      pendingUpgrades: state.pendingUpgrades.map(p =>
+        p.existing.id === existingId ? { ...p, selectedOption: option } : p
+      )
+    }));
+  },
+
+  setUpgradeMappings: (existingId, mappings) => {
+    set(state => ({
+      pendingUpgrades: state.pendingUpgrades.map(p =>
+        p.existing.id === existingId ? { ...p, customMappings: mappings } : p
+      )
+    }));
+  },
+
+  confirmTemplateUpgrades: async () => {
+    const { pendingUpgrades, issues: allIssues, currentUser } = get();
+    let upgradedCount = 0, migratedCount = 0, keptCount = 0;
+
+    if (!currentUser || !canUpgradeTemplate(currentUser)) {
+      get().addToast('error', '仅督导可确认模板升级');
+      return { upgraded: 0, migrated: 0, kept: 0 };
+    }
+
+    const now = new Date().toISOString();
+
+    for (const upgrade of pendingUpgrades) {
+      const { existing, incoming, diff, selectedOption, customMappings } = upgrade;
+
+      const result = applyTemplateUpgrade(
+        allIssues,
+        existing,
+        incoming,
+        diff,
+        selectedOption,
+        customMappings.length > 0 ? customMappings : undefined
+      );
+
+      await db.putTemplate({
+        ...incoming,
+        parentId: existing.id,
+      });
+
+      const deprecatedExisting: Template = {
+        ...existing,
+        deprecated: true,
+        supersededBy: incoming.id,
+      };
+      await db.putTemplate(deprecatedExisting);
+
+      if (result.migratedIssues.length > 0) {
+        await db.updateIssues(result.migratedIssues);
+        migratedCount += result.migratedIssues.length;
+      }
+      keptCount += result.keptIssues.length;
+
+      const migrationRecord: MigrationRecord = {
+        id: generateId(),
+        ...result.migrationRecord,
+        operatorId: currentUser.id,
+        operatorRole: currentUser.role,
+        createdAt: now,
+        remark: `模板升级：由督导 ${currentUser.name} 执行，策略=${selectedOption}`,
+      };
+      await db.addMigration(migrationRecord);
+
+      const historyRecords = result.histories.map(h => ({
+        id: generateId(),
+        timestamp: now,
+        ...h,
+        operatorId: currentUser.id,
+        operatorRole: currentUser.role as UserRole,
+      } as History));
+      await db.addHistories(historyRecords);
+
+      upgradedCount++;
+    }
+
+    const [templates, issues, migrations, histories] = await Promise.all([
+      db.getAllTemplates(),
+      db.getAllIssues(),
+      db.getAllMigrations(),
+      db.getAllHistories(),
+    ]);
+    set({
+      templates,
+      issues,
+      migrations,
+      histories,
+      pendingUpgrades: [],
+      lastImportValidation: null,
+    });
+
+    get().addToast('success', `已升级 ${upgradedCount} 个模板，迁移 ${migratedCount} 条问题，保留 ${keptCount} 条旧草稿`);
+
+    return { upgraded: upgradedCount, migrated: migratedCount, kept: keptCount };
+  },
+
+  cancelPendingUpgrades: () => {
+    set({ pendingUpgrades: [], lastImportValidation: null });
+    get().addToast('info', '已取消待处理的模板升级');
   },
 
   createIssue: async (issueData) => {
@@ -130,6 +406,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!currentUser) return { success: false, error: '请先选择身份' };
 
     const template = templates.find(t => t.id === issueData.templateId);
+    if (!template) return { success: false, error: '所选模板不存在' };
+
     if (template) {
       const requiredKeys = template.fields.filter(f => f.required).map(f => f.key);
       const validation = validateRequiredFields(issueData.data, requiredKeys);
@@ -144,9 +422,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     const now = new Date().toISOString();
+    const templateVersion = issueData.templateVersion || template?.version || '1.0';
+
     const issue: Issue = {
       ...issueData,
       id: issueData.id || generateId(),
+      templateVersion,
       version: 1,
       createdAt: now,
       updatedAt: now,
@@ -162,7 +443,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       operatorId: currentUser.id,
       operatorRole: currentUser.role,
       toStatus: issue.status,
-      timestamp: now
+      timestamp: now,
+      templateVersion,
     };
     await db.addHistory(history);
 
@@ -182,7 +464,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const issue = get().issues.find(i => i.id === id);
     if (!issue) return;
 
-    const { currentUser } = get();
+    const { currentUser, templates } = get();
     const now = new Date().toISOString();
     const updated: Issue = {
       ...issue,
@@ -195,13 +477,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     await db.updateIssue(updated);
 
     if (currentUser) {
+      const template = templates.find(t => t.id === issue.templateId);
       const history: History = {
         id: generateId(),
         issueId: id,
         action: 'update',
         operatorId: currentUser.id,
         operatorRole: currentUser.role,
-        timestamp: now
+        timestamp: now,
+        templateVersion: template?.version || issue.templateVersion,
       };
       await db.addHistory(history);
     }
@@ -270,7 +554,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       fromStatus,
       toStatus: status,
       timestamp: now,
-      remark
+      remark,
+      templateVersion: issue.templateVersion,
     };
     await db.addHistory(history);
 
@@ -302,7 +587,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   processSyncQueue: async (simulateConflict = false) => {
-    const { syncQueue: currentSyncQueue, isOnline } = get();
+    const { syncQueue: currentSyncQueue, isOnline, templates } = get();
     if (!isOnline) {
       get().addToast('warning', '当前离线，无法同步');
       return;
@@ -320,15 +605,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         await db.updateIssue({ ...item.payload, synced: true, version: item.payload.version + 1 });
         await db.updateSyncQueueItem({ ...item, status: 'completed' });
       } else if (result.conflict && result.remoteVersion) {
-        const conflict = createConflict(item.payload, result.remoteVersion);
+        const conflict = createConflict(item.payload, result.remoteVersion, templates);
         await db.addConflict(conflict);
+        const errorMsg = result.templateVersionMismatch
+          ? `模板版本冲突：本地 v${result.templateVersionMismatch.localVersion} vs 远端 v${result.templateVersionMismatch.remoteVersion}`
+          : '版本冲突，需要人工处理';
         await db.updateSyncQueueItem({
           ...item,
           status: 'failed',
           retryCount: item.retryCount + 1,
-          errorMessage: '版本冲突，需要人工处理'
+          errorMessage: errorMsg,
         });
-        get().addToast('error', `同步冲突：「${item.payload.title}」需要处理`);
+        get().addToast('error', `同步冲突：「${item.payload.title}」${errorMsg}`);
       } else {
         await db.updateSyncQueueItem({
           ...item,
@@ -367,7 +655,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   forceConflictSync: async () => {
-    const { syncQueue: currentSyncQueue, isOnline } = get();
+    const { syncQueue: currentSyncQueue, isOnline, templates } = get();
     if (!isOnline) {
       get().addToast('warning', '当前离线，无法同步');
       return;
@@ -390,14 +678,17 @@ export const useAppStore = create<AppState>((set, get) => ({
           c => c.issueId === item.issueId && c.status === 'pending'
         );
         if (!existingConflict) {
-          const conflict = createConflict(item.payload, result.remoteVersion);
+          const conflict = createConflict(item.payload, result.remoteVersion, templates);
           await db.addConflict(conflict);
         }
+        const errorMsg = result.templateVersionMismatch
+          ? `模板版本冲突：本地 v${result.templateVersionMismatch.localVersion} vs 远端 v${result.templateVersionMismatch.remoteVersion}`
+          : '版本冲突：本地与远程内容不一致，需人工处理';
         await db.updateSyncQueueItem({
           ...item,
           status: 'failed',
           retryCount: item.retryCount + 1,
-          errorMessage: '版本冲突：本地与远程内容不一致，需人工处理'
+          errorMessage: errorMsg,
         });
       }
     }
@@ -431,17 +722,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     const conflict = get().conflicts.find(c => c.id === conflictId);
     if (!conflict) return;
 
+    const { currentUser } = get();
+    if (currentUser && !hasPermission(currentUser.role, 'conflict:resolve')) {
+      get().addToast('error', '仅督导可解决同步冲突');
+      return;
+    }
+
     let resolvedIssue: Issue;
     if (resolution === 'local') {
-      resolvedIssue = { ...conflict.localVersion, version: conflict.remoteVersion.version + 1 };
+      resolvedIssue = {
+        ...conflict.localVersion,
+        version: conflict.remoteVersion.version + 1,
+        templateVersion: conflict.localVersion.templateVersion || '1.0',
+      };
     } else if (resolution === 'remote') {
-      resolvedIssue = { ...conflict.remoteVersion };
+      resolvedIssue = {
+        ...conflict.remoteVersion,
+        templateVersion: conflict.remoteVersion.templateVersion || '1.0',
+      };
     } else {
+      const chosenTemplateVersion = isNewerVersion(
+        conflict.remoteVersion.templateVersion || '1.0',
+        conflict.localVersion.templateVersion || '1.0'
+      )
+        ? conflict.remoteVersion.templateVersion
+        : conflict.localVersion.templateVersion;
+
       resolvedIssue = {
         ...conflict.localVersion,
         version: conflict.remoteVersion.version + 1,
         data: { ...conflict.remoteVersion.data, ...conflict.localVersion.data },
-        title: `${conflict.localVersion.title} (合并)`
+        title: `${conflict.localVersion.title} (合并)`,
+        templateVersion: chosenTemplateVersion || '1.0',
       };
     }
 
@@ -479,15 +791,31 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   exportData: (format) => {
-    const { issues, stores, templates } = get();
+    const { issues, stores, templates, migrations, conflicts, currentUser } = get();
     const timestamp = new Date().toISOString().slice(0, 10);
+    const unresolvedConflicts = conflicts.filter(c => c.status === 'pending');
 
     if (format === 'json') {
-      const data = { issues, stores, templates, exportedAt: new Date().toISOString() };
+      const data = {
+        issues,
+        stores,
+        templates,
+        migrations,
+        unresolvedConflicts,
+        exportedAt: new Date().toISOString(),
+        exportedBy: currentUser,
+      };
       downloadFile(exportToJSON(data), `inspection-export-${timestamp}.json`, 'application/json');
     } else {
-      downloadFile(exportToCSV(issues, stores, templates), `inspection-export-${timestamp}.csv`, 'text/csv');
+      downloadFile(exportToCSV(issues, stores, templates, migrations), `inspection-export-${timestamp}.csv`, 'text/csv');
     }
-    get().addToast('success', '数据导出成功');
-  }
+    get().addToast('success', `数据导出成功（含 ${migrations.length} 条迁移记录，${unresolvedConflicts.length} 条未处理冲突）`);
+  },
+
+  getTemplateForIssue: (issue) => {
+    const { templates } = get();
+    return templates.find(
+      t => t.id === issue.templateId && t.version === issue.templateVersion
+    ) || templates.find(t => t.id === issue.templateId);
+  },
 }));

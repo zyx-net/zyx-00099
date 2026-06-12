@@ -68,7 +68,8 @@ export const ACTION_LABELS: Record<HistoryAction, string> = {
   submit: '提交',
   reject: '驳回',
   close: '关闭',
-  reopen: '重新打开'
+  reopen: '重新打开',
+  migrate: '迁移'
 };
 
 export function getRoleName(role: UserRole): string {

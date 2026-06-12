@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/store';
 import { IssueStatus, Issue } from '@/types';
@@ -8,7 +8,7 @@ import { formatDate, ACTION_LABELS, getRoleName } from '@/utils/helpers';
 import {
   ArrowLeft, Store, Calendar, User, FileText, CloudOff, Cloud, AlertTriangle,
   CheckCircle, XCircle, Edit3, Image as ImageIcon, MessageSquare, AlertCircle,
-  History as HistoryIcon
+  History as HistoryIcon, GitBranch, Shield, RefreshCw, ArrowRight
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -16,8 +16,8 @@ export default function IssueDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const {
-    issues, stores, templates, currentUser, histories, conflicts,
-    updateIssueStatus, resolveConflict, addToast
+    issues, stores, templates, currentUser, histories, conflicts, migrations,
+    updateIssueStatus, resolveConflict, addToast, getTemplateForIssue,
   } = useAppStore();
 
   const [showConflict, setShowConflict] = useState(false);
@@ -26,11 +26,22 @@ export default function IssueDetail() {
 
   const issue = issues.find(i => i.id === id);
   const store = stores.find(s => s.id === issue?.storeId);
-  const template = templates.find(t => t.id === issue?.templateId);
+  const template = issue ? getTemplateForIssue(issue) : undefined;
   const issueHistories = histories.filter(h => h.issueId === id).sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
   const pendingConflict = conflicts.find(c => c.issueId === id && c.status === 'pending');
+
+  const isCurrentTemplateLatest = useMemo(() => {
+    if (!issue || !templates.length) return true;
+    const sameIdTemplates = templates.filter(t => t.id === issue.templateId && !t.deprecated);
+    return sameIdTemplates.length === 0 || sameIdTemplates.some(t => t.version === issue.templateVersion);
+  }, [issue, templates]);
+
+  const migrationInfo = useMemo(() => {
+    if (!issue?.migrationSource) return null;
+    return migrations.find(m => m.id === issue.migrationSource!.migrationId);
+  }, [issue, migrations]);
 
   useEffect(() => {
     if (pendingConflict) {
@@ -84,14 +95,14 @@ export default function IssueDetail() {
   };
 
   const renderFieldValue = (key: string, value: any) => {
-    if (!value) return <span className="text-gray-400">未填写</span>;
+    if (value === undefined || value === null || value === '') return <span className="text-gray-400">未填写</span>;
     if (typeof value === 'boolean') return value ? '是' : '否';
     return value;
   };
 
   const ConflictCard = () => {
     if (!pendingConflict) return null;
-    const { localVersion, remoteVersion } = pendingConflict;
+    const { localVersion, remoteVersion, templateVersionConflict } = pendingConflict;
 
     const compareIssues = (a: Issue, b: Issue) => {
       const diffs: { field: string; local: any; remote: any }[] = [];
@@ -118,19 +129,52 @@ export default function IssueDetail() {
             <p className="text-red-600 text-sm mt-1">
               本地版本与远程版本存在差异，请选择保留哪一方或合并
             </p>
+            {templateVersionConflict && (
+              <p className="text-red-700 text-xs mt-1 font-medium">
+                模板版本不一致：本地 v{templateVersionConflict.localTemplateVersion} vs 远端 v{templateVersionConflict.remoteTemplateVersion}
+              </p>
+            )}
             <p className="text-red-500 text-xs mt-1">
               检测时间: {formatDate(pendingConflict.detectedAt)}
             </p>
           </div>
         </div>
 
+        {templateVersionConflict?.diff && (
+          <div className="bg-red-100/50 rounded-lg p-3 mb-4 border border-red-200">
+            <p className="text-sm font-medium text-red-800 mb-2">模板字段差异：</p>
+            <div className="flex flex-wrap gap-2">
+              {templateVersionConflict.diff.addedFields.length > 0 && (
+                <span className="text-xs px-2 py-1 bg-green-100 text-green-700 rounded">
+                  新增 {templateVersionConflict.diff.addedFields.length} 字段
+                </span>
+              )}
+              {templateVersionConflict.diff.removedFields.length > 0 && (
+                <span className="text-xs px-2 py-1 bg-red-200 text-red-800 rounded">
+                  删除 {templateVersionConflict.diff.removedFields.length} 字段
+                </span>
+              )}
+              {templateVersionConflict.diff.modifiedFields.length > 0 && (
+                <span className="text-xs px-2 py-1 bg-yellow-100 text-yellow-700 rounded">
+                  修改 {templateVersionConflict.diff.modifiedFields.length} 字段
+                </span>
+              )}
+              {templateVersionConflict.diff.renamedFields.length > 0 && (
+                <span className="text-xs px-2 py-1 bg-purple-100 text-purple-700 rounded">
+                  重命名 {templateVersionConflict.diff.renamedFields.length} 字段
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         <div className="bg-white rounded-lg overflow-hidden mb-4">
           <table className="w-full text-sm">
             <thead>
               <tr className="bg-gray-100">
                 <th className="px-4 py-2 text-left font-medium text-gray-600">字段</th>
-                <th className="px-4 py-2 text-left font-medium text-blue-600">本地版本</th>
-                <th className="px-4 py-2 text-left font-medium text-orange-600">远程版本</th>
+                <th className="px-4 py-2 text-left font-medium text-blue-600">本地版本 (v{localVersion.templateVersion || '1.0'})</th>
+                <th className="px-4 py-2 text-left font-medium text-orange-600">远程版本 (v{remoteVersion.templateVersion || '1.0'})</th>
               </tr>
             </thead>
             <tbody>
@@ -185,6 +229,49 @@ export default function IssueDetail() {
 
       {showConflict && pendingConflict && <ConflictCard />}
 
+      {issue.migrationSource && (
+        <div className="bg-purple-50 border border-purple-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <GitBranch className="text-purple-600 flex-shrink-0 mt-0.5" size={18} />
+            <div className="text-sm text-purple-800 flex-1">
+              <p className="font-medium">此问题已从模板旧版本迁移</p>
+              <p className="text-purple-700">
+                v{issue.migrationSource.fromTemplateVersion} → v{issue.templateVersion}
+                {migrationInfo && ` · 迁移策略：${
+                  migrationInfo.option === 'keep_old' ? '保留旧草稿' :
+                  migrationInfo.option === 'migrate' ? '按映射迁移' : '仅非草稿迁移'
+                }`}
+              </p>
+              <p className="text-xs text-purple-500 mt-1">
+                迁移时间：{formatDate(issue.migrationSource.migratedAt)} · 迁移ID：{issue.migrationSource.migrationId.slice(0, 12)}...
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {!isCurrentTemplateLatest && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="text-yellow-600 flex-shrink-0 mt-0.5" size={18} />
+            <div className="text-sm text-yellow-800 flex-1">
+              <p className="font-medium">
+                该问题使用的模板版本 v{issue.templateVersion} 不是最新版本
+              </p>
+              {currentUser?.role === 'supervisor' ? (
+                <p className="text-yellow-700 mt-1">
+                  您可在 <button onClick={() => navigate('/config')} className="underline font-medium">配置管理</button> 中进行模板迁移升级
+                </p>
+              ) : (
+                <p className="text-yellow-700 mt-1">
+                  如需升级，请联系督导进行模板迁移操作
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
         <div className="p-6 border-b bg-gray-50">
           <div className="flex items-start justify-between gap-4">
@@ -209,7 +296,12 @@ export default function IssueDetail() {
                 </span>
               )}
               <span className="text-gray-300">|</span>
-              <span>版本 v{issue.version}</span>
+              <span>数据 v{issue.version}</span>
+              <span className="text-gray-300">|</span>
+              <span className="flex items-center gap-1">
+                <FileText size={14} />
+                模板 v{issue.templateVersion}
+              </span>
             </div>
           </div>
         </div>
@@ -231,7 +323,10 @@ export default function IssueDetail() {
               </div>
               <div>
                 <p className="text-xs text-gray-500">检查模板</p>
-                <p className="font-medium text-gray-800">{template?.name || '-'}</p>
+                <p className="font-medium text-gray-800">
+                  {template?.name || '-'}
+                  <span className="text-xs text-gray-500 ml-1">v{template?.version || issue.templateVersion}</span>
+                </p>
               </div>
             </div>
             <div className="flex items-center gap-3">
@@ -262,9 +357,22 @@ export default function IssueDetail() {
               <div className="grid grid-cols-2 gap-4">
                 {template.fields.map(field => (
                   <div key={field.key} className="bg-gray-50 rounded-lg p-4">
-                    <p className="text-xs text-gray-500 mb-1">{field.label}</p>
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="text-xs text-gray-500">{field.label}</p>
+                      {field.required && <span className="text-xs text-red-500">*</span>}
+                    </div>
                     <p className="font-medium text-gray-800">
                       {renderFieldValue(field.key, issue.data[field.key])}
+                    </p>
+                  </div>
+                ))}
+                {Object.keys(issue.data).filter(key => !template.fields.some(f => f.key === key)).map(key => (
+                  <div key={key} className="bg-yellow-50 rounded-lg p-4 border border-yellow-200">
+                    <div className="flex items-center gap-2 mb-1">
+                      <p className="text-xs text-yellow-600">{key} <span className="italic">（旧模板字段）</span></p>
+                    </div>
+                    <p className="font-medium text-gray-800">
+                      {renderFieldValue(key, issue.data[key])}
                     </p>
                   </div>
                 ))}
@@ -362,10 +470,12 @@ export default function IssueDetail() {
                     'w-8 h-8 rounded-full flex items-center justify-center',
                     history.action === 'close' ? 'bg-green-100' :
                     history.action === 'reject' ? 'bg-red-100' :
-                    history.action === 'submit' ? 'bg-blue-100' : 'bg-gray-100'
+                    history.action === 'submit' ? 'bg-blue-100' :
+                    history.action === 'migrate' ? 'bg-purple-100' : 'bg-gray-100'
                   )}>
                     {history.action === 'close' ? <CheckCircle size={14} className="text-green-600" /> :
                      history.action === 'reject' ? <XCircle size={14} className="text-red-600" /> :
+                     history.action === 'migrate' ? <GitBranch size={14} className="text-purple-600" /> :
                      <Edit3 size={14} className="text-gray-600" />}
                   </div>
                   {idx !== issueHistories.length - 1 && (
@@ -373,13 +483,24 @@ export default function IssueDetail() {
                   )}
                 </div>
                 <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1">
+                  <div className="flex items-center gap-2 mb-1 flex-wrap">
                     <span className="font-medium text-gray-800">
                       {ACTION_LABELS[history.action]}
                     </span>
                     {history.fromStatus && history.toStatus && (
                       <span className="text-sm text-gray-500">
                         ({history.fromStatus} → {history.toStatus})
+                      </span>
+                    )}
+                    {history.templateVersion && (
+                      <span className="text-xs px-2 py-0.5 bg-blue-50 text-blue-700 rounded">
+                        模板 v{history.templateVersion}
+                      </span>
+                    )}
+                    {history.migrationInfo && (
+                      <span className="text-xs px-2 py-0.5 bg-purple-50 text-purple-700 rounded flex items-center gap-1">
+                        <RefreshCw size={10} />
+                        v{history.migrationInfo.fromVersion} <ArrowRight size={10} /> v{history.migrationInfo.toVersion}
                       </span>
                     )}
                   </div>

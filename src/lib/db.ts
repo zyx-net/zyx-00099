@@ -1,17 +1,18 @@
 import { openDB, IDBPDatabase } from 'idb';
-import { Issue, Store, Template, History, Conflict, SyncQueueItem, User } from '@/types';
+import { Issue, Store, Template, History, Conflict, SyncQueueItem, User, MigrationRecord } from '@/types';
 
 const DB_NAME = 'inspection-pwa-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 export interface DBSchema {
   users: { key: string; value: User };
   stores: { key: string; value: Store };
-  templates: { key: string; value: Template };
-  issues: { key: string; value: Issue; indexes: { 'by-status': string; 'by-store': string; 'by-creator': string } };
+  templates: { key: string; value: Template; indexes: { 'by-name': string; 'by-version': string } };
+  issues: { key: string; value: Issue; indexes: { 'by-status': string; 'by-store': string; 'by-creator': string; 'by-template': string; 'by-template-version': string } };
   histories: { key: string; value: History; indexes: { 'by-issue': string } };
   conflicts: { key: string; value: Conflict; indexes: { 'by-issue': string } };
   syncQueue: { key: string; value: SyncQueueItem; indexes: { 'by-status': string; 'by-issue': string } };
+  migrations: { key: string; value: MigrationRecord; indexes: { 'by-template': string; 'by-operator': string } };
 }
 
 let db: IDBPDatabase<DBSchema> | null = null;
@@ -20,7 +21,7 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
   if (db) return db;
 
   db = await openDB<DBSchema>(DB_NAME, DB_VERSION, {
-    upgrade(db) {
+    upgrade(db, oldVersion) {
       if (!db.objectStoreNames.contains('users')) {
         db.createObjectStore('users', { keyPath: 'id' });
       }
@@ -28,13 +29,33 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
         db.createObjectStore('stores', { keyPath: 'id' });
       }
       if (!db.objectStoreNames.contains('templates')) {
-        db.createObjectStore('templates', { keyPath: 'id' });
+        const tplStore = db.createObjectStore('templates', { keyPath: 'id' });
+        tplStore.createIndex('by-name', 'name');
+        tplStore.createIndex('by-version', 'version');
+      } else if (oldVersion < 2) {
+        const tplStore = db.transaction('templates', 'readwrite').store as any;
+        if (!tplStore.indexNames.contains('by-name')) {
+          tplStore.createIndex('by-name', 'name');
+        }
+        if (!tplStore.indexNames.contains('by-version')) {
+          tplStore.createIndex('by-version', 'version');
+        }
       }
       if (!db.objectStoreNames.contains('issues')) {
         const issueStore = db.createObjectStore('issues', { keyPath: 'id' });
         issueStore.createIndex('by-status', 'status');
         issueStore.createIndex('by-store', 'storeId');
         issueStore.createIndex('by-creator', 'creatorId');
+        issueStore.createIndex('by-template', 'templateId');
+        issueStore.createIndex('by-template-version', ['templateId', 'templateVersion']);
+      } else if (oldVersion < 2) {
+        const issueStore = db.transaction('issues', 'readwrite').store as any;
+        if (!issueStore.indexNames.contains('by-template')) {
+          issueStore.createIndex('by-template', 'templateId');
+        }
+        if (!issueStore.indexNames.contains('by-template-version')) {
+          issueStore.createIndex('by-template-version', ['templateId', 'templateVersion']);
+        }
       }
       if (!db.objectStoreNames.contains('histories')) {
         const historyStore = db.createObjectStore('histories', { keyPath: 'id' });
@@ -48,6 +69,11 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
         const syncStore = db.createObjectStore('syncQueue', { keyPath: 'id' });
         syncStore.createIndex('by-status', 'status');
         syncStore.createIndex('by-issue', 'issueId');
+      }
+      if (!db.objectStoreNames.contains('migrations')) {
+        const migrationStore = db.createObjectStore('migrations', { keyPath: 'id' });
+        migrationStore.createIndex('by-template', 'templateId');
+        migrationStore.createIndex('by-operator', 'operatorId');
       }
     },
   });
@@ -76,9 +102,24 @@ export async function getAllTemplates(): Promise<Template[]> {
   return database.getAll('templates');
 }
 
+export async function getTemplateById(id: string): Promise<Template | undefined> {
+  const database = await initDB();
+  return database.get('templates', id);
+}
+
+export async function getTemplatesByName(name: string): Promise<Template[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('templates', 'by-name', name);
+}
+
 export async function addTemplate(template: Template): Promise<string> {
   const database = await initDB();
   return database.add('templates', template) as Promise<string>;
+}
+
+export async function putTemplate(template: Template): Promise<string> {
+  const database = await initDB();
+  return database.put('templates', template) as Promise<string>;
 }
 
 export async function addTemplates(templates: Template[]): Promise<void> {
@@ -87,9 +128,20 @@ export async function addTemplates(templates: Template[]): Promise<void> {
   await Promise.all([...templates.map(t => tx.store.add(t)), tx.done]);
 }
 
+export async function putTemplates(templates: Template[]): Promise<void> {
+  const database = await initDB();
+  const tx = database.transaction('templates', 'readwrite');
+  await Promise.all([...templates.map(t => tx.store.put(t)), tx.done]);
+}
+
 export async function getAllIssues(): Promise<Issue[]> {
   const database = await initDB();
   return database.getAll('issues');
+}
+
+export async function getIssuesByTemplate(templateId: string): Promise<Issue[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('issues', 'by-template', templateId);
 }
 
 export async function getIssueById(id: string): Promise<Issue | undefined> {
@@ -107,6 +159,12 @@ export async function updateIssue(issue: Issue): Promise<string> {
   return database.put('issues', issue) as Promise<string>;
 }
 
+export async function updateIssues(issues: Issue[]): Promise<void> {
+  const database = await initDB();
+  const tx = database.transaction('issues', 'readwrite');
+  await Promise.all([...issues.map(i => tx.store.put(i)), tx.done]);
+}
+
 export async function deleteIssue(id: string): Promise<void> {
   const database = await initDB();
   await database.delete('issues', id);
@@ -120,6 +178,12 @@ export async function getHistoriesByIssue(issueId: string): Promise<History[]> {
 export async function addHistory(history: History): Promise<string> {
   const database = await initDB();
   return database.add('histories', history) as Promise<string>;
+}
+
+export async function addHistories(histories: History[]): Promise<void> {
+  const database = await initDB();
+  const tx = database.transaction('histories', 'readwrite');
+  await Promise.all([...histories.map(h => tx.store.add(h)), tx.done]);
 }
 
 export async function getAllHistories(): Promise<History[]> {
@@ -167,6 +231,21 @@ export async function getSyncQueueByStatus(status: string): Promise<SyncQueueIte
   return database.getAllFromIndex('syncQueue', 'by-status', status);
 }
 
+export async function getAllMigrations(): Promise<MigrationRecord[]> {
+  const database = await initDB();
+  return database.getAll('migrations');
+}
+
+export async function getMigrationsByTemplate(templateId: string): Promise<MigrationRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('migrations', 'by-template', templateId);
+}
+
+export async function addMigration(migration: MigrationRecord): Promise<string> {
+  const database = await initDB();
+  return database.add('migrations', migration) as Promise<string>;
+}
+
 export async function getCurrentUser(): Promise<User | null> {
   const stored = localStorage.getItem('currentUser');
   return stored ? JSON.parse(stored) : null;
@@ -183,7 +262,7 @@ export async function saveCurrentUser(user: User | null): Promise<void> {
 export async function clearAllData(): Promise<void> {
   const database = await initDB();
   const tx = database.transaction(
-    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue'],
+    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations'],
     'readwrite'
   );
   await Promise.all([
@@ -193,6 +272,7 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore('histories').clear(),
     tx.objectStore('conflicts').clear(),
     tx.objectStore('syncQueue').clear(),
+    tx.objectStore('migrations').clear(),
     tx.done,
   ]);
 }

@@ -1,6 +1,6 @@
 # 巡店问题采集 PWA
 
-本地优先的巡店问题采集 Progressive Web App，支持离线创建问题、多角色权限管理、同步队列、版本冲突处理。
+本地优先的巡店问题采集 Progressive Web App，支持离线创建问题、多角色权限管理、同步队列、版本冲突处理、**模板多版本升级与迁移**。
 
 ## 功能特性
 
@@ -13,6 +13,14 @@
 - **操作历史**：完整记录问题的每一次状态变更
 - **数据导出**：支持 JSON 和 CSV 格式导出
 - **PWA**：支持安装到桌面，离线可用
+- **模板多版本管理**：同一模板支持多版本并存，升级时不覆盖旧版本
+- **智能版本差异对比**：自动识别字段的新增、删除、修改、重命名，展示影响范围
+- **三种草稿迁移策略**：保留旧草稿 / 按映射迁移草稿 / 只对新问题生效
+- **迁移溯源链**：每条迁移数据都记录来源版本、迁移 ID 和时间戳
+- **跨重启版本恢复**：所有版本信息持久化到 IndexedDB，重启后精确恢复
+- **导出增强**：JSON/CSV 携带模板版本、迁移记录、未处理冲突
+- **导入校验**：识别同名不同版本、重复版本、缺字段数据，给出明确提示
+- **模板版本冲突**：同步时本地旧模板 / 远端新模板的特殊冲突处理
 
 ## 角色权限矩阵
 
@@ -25,9 +33,11 @@
 | 关闭问题 | ❌ | ✅（仅限本门店） | ✅ |
 | 驳回问题 | ❌ | ❌ | ✅ |
 | 导入模板/门店 | ❌ | ❌ | ✅ |
+| **升级模板版本** | ❌ | ❌ | ✅ |
 | 管理同步 | ❌ | ❌ | ✅ |
 | 解决冲突 | ❌ | ❌ | ✅ |
 | 导出数据 | ❌ | ✅ | ✅ |
+| 查看模板版本提示 | ✅（仅限自己的问题） | ✅（仅限本门店问题） | ✅ |
 
 ## 快速开始
 
@@ -67,7 +77,7 @@ npm run preview
 
 ### 自动化验证脚本
 
-运行核心逻辑验证（门店归属权限、冲突处理、列表过滤）：
+运行核心逻辑验证（门店归属权限、冲突处理、列表过滤、模板版本升级）：
 
 ```bash
 npm run verify
@@ -75,17 +85,56 @@ npm run verify
 
 覆盖场景：
 
+#### 门店归属权限
 1. ✅ 店长可关闭自己门店的问题
 2. ✅ 店长不可关闭其他门店的问题
 3. ✅ 督导可关闭任意门店的问题
 4. ✅ 巡检员不能关闭任何问题
 5. ✅ 只有督导可驳回问题
 6. ✅ 用户或问题为空时权限校验返回 false
-7. ✅ 模拟同步冲突返回冲突标记和远端版本
-8. ✅ 冲突保留本地和远端两份完整内容
-9. ✅ 非冲突场景同步成功
-10. ✅ 店长只能看到自己门店的问题
-11. ✅ 督导可看到所有问题
+
+#### 语义化版本对比
+7. ✅ 版本号大小比较正确（1.0 < 2.0、1.10 > 1.9 等）
+
+#### 模板升级导入
+8. ✅ diff 正确识别字段新增、删除、修改、重命名
+9. ✅ diffTemplateVersions 返回完整影响摘要（草稿数、待同步数、数据丢失风险）
+10. ✅ 同名同版本重复导入被识别并跳过（有警告，不静默）
+11. ✅ 同名不同版本触发升级提示（标记 hasUpgrades）
+12. ✅ 导入缺少必填字段的模板给出警告不静默
+13. ✅ 导入已有更新版本时给出警告
+
+#### 草稿迁移三种策略
+14. ✅ keep_old 策略保留所有草稿原版本不变
+15. ✅ migrate 策略迁移所有问题并写清来源（migrationSource）
+16. ✅ new_only 策略草稿保留旧版、已提交迁移
+17. ✅ 字段映射迁移：重命名字段值正确传递，新增字段填充默认值
+18. ✅ 迁移记录溯源链完整（MigrationRecord ↔ Issue.migrationSource ↔ History.migrationInfo）
+
+#### 无权限操作
+19. ✅ 店长无 template:upgrade 权限
+20. ✅ 巡检员无 template:upgrade 权限
+21. ✅ 督导有 template:upgrade 权限
+22. ✅ 店长导入模板被拒绝（返回 permission_denied 错误）
+23. ✅ 巡检员导入模板被拒绝（返回 permission_denied 错误）
+
+#### 模板版本同步冲突
+24. ✅ 本地旧模板/远端新模板触发特殊冲突并携带 diff
+25. ✅ 冲突双方版本独立保留互不覆盖
+
+#### 导入导出往返
+26. ✅ buildExportPayload 包含版本/迁移/冲突信息
+27. ✅ 导出后再导入数据完整保留（往返一致性）
+28. ✅ parseExportPayload 识别旧 schema 和缺字段给出警告
+29. ✅ parseExportPayload 格式错误不静默吞掉
+
+#### 跨重启数据恢复
+30. ✅ 问题 templateVersion 默认值规范化（旧数据补 1.0）
+31. ✅ 多版本模板并存恢复：旧版本不被覆盖，问题精确绑定各自版本
+
+#### 原有核心功能回归
+32. ✅ 店长只能看到自己门店的问题
+33. ✅ 督导可看到所有问题
 
 ### 手动验证流程
 
@@ -132,12 +181,63 @@ npm run verify
    - 采用远程版本
    - 合并双方内容
 
+#### 场景 5：督导导入模板新版本并升级
+
+1. 以「督导」身份进入「配置导入」页面
+2. 导入一份包含模板 v1.0 的配置 JSON
+3. 以「巡检员」身份基于该模板创建几个草稿和已提交问题
+4. 回到「督导」身份，导入同名称但 v2.0 的新模板（字段有增删改）
+5. 确认页面自动切换到「升级确认」视图：
+   - 显示差异对比表格（新增/删除/修改/重命名字段分别标记颜色）
+   - 显示影响摘要（受影响问题数、草稿数、待同步数、可能丢失数据的字段数）
+   - 三种迁移策略卡片可选：保留旧草稿 / 按映射迁移 / 只对新问题生效
+6. 选择「按映射迁移草稿」，点击「确认升级」
+7. 进入「问题详情」：
+   - 每个迁移过的问题顶部显示紫色「迁移来源」卡片（v1.0 → v2.0）
+   - 「操作历史」有一条紫色「迁移」记录，带版本号 badge
+   - 旧字段（如果有）显示黄色背景标记
+8. 刷新页面（模拟重启），确认所有版本绑定和迁移标记都正确恢复
+
+#### 场景 6：店长/巡检员无升级权限
+
+1. 以「店长」或「巡检员」身份尝试访问「配置导入」页面
+2. 确认「升级模板」按钮不可见或禁用
+3. 尝试通过浏览器控制台强制调用 `importTemplates` 升级接口
+4. 确认返回权限拒绝错误，没有任何模板或问题被修改
+
+#### 场景 7：导出导入往返完整保留版本信息
+
+1. 以「督导」身份完成场景 5 的升级流程
+2. 进入「数据导出」页面
+3. 确认统计面板显示：多版本模板数、迁移记录数、未处理冲突数
+4. 分别导出 JSON 和 CSV：
+   - JSON：确认包含 templates（多版本）、migrations、unresolvedConflicts、schemaVersion: "2.0"
+   - CSV：确认包含 templateVersion、migrationId 等列
+5. 删除本地数据（或用无痕窗口），以「督导」身份导入刚才的 JSON 备份
+6. 确认：
+   - 同名不同版本被识别，给出提示而非静默覆盖
+   - 迁移记录完整恢复
+   - 问题的 templateVersion 和 migrationSource 正确绑定
+   - 如果备份文件缺字段，有明确警告而不是静默吞掉
+
+#### 场景 8：同步时模板版本冲突
+
+1. 设备 A（督导）：导入模板 v1.0
+2. 设备 A（巡检员）：基于 v1.0 创建问题并保持离线（草稿在本地队列）
+3. 设备 B（督导）：导入同一模板的 v2.0 并完成升级同步
+4. 设备 A（巡检员）：恢复网络，触发同步
+5. 确认：
+   - 该问题的同步项触发特殊「模板版本冲突」
+   - 冲突详情页显示本地 v1.0 和远端 v2.0 的字段差异摘要
+   - 双方版本独立保留，互不覆盖
+   - 督导进入冲突处理页，可选择保留哪个版本或手动合并
+
 ## 技术栈
 
 - **框架**：React 18 + TypeScript
 - **构建**：Vite
 - **状态管理**：Zustand
-- **本地存储**：IndexedDB (idb 库)
+- **本地存储**：IndexedDB (idb 库)，DB_VERSION = 2
 - **样式**：TailwindCSS 3
 - **路由**：React Router DOM
 - **图标**：Lucide React
@@ -149,10 +249,17 @@ npm run verify
 src/
 ├── components/       # 通用组件
 ├── lib/             # 基础设施（数据库、工具函数）
+│   └── db.ts        # IndexedDB 封装（含 migrations store、版本索引）
 ├── pages/           # 页面组件
-├── services/        # 业务服务（同步服务）
-├── store/           # 全局状态管理
+│   ├── ConfigImport.tsx  # 模板导入 + 升级确认视图
+│   ├── IssueDetail.tsx   # 问题详情 + 迁移来源 + 版本冲突
+│   └── Export.tsx        # 数据导出（含版本/迁移/冲突统计）
+├── services/        # 业务服务
+│   ├── templateVersionService.ts  # 版本对比、迁移执行、导入校验、导出增强
+│   └── syncService.ts             # 同步 + 模板版本冲突检测
+├── store/           # 全局状态管理（Zustand）
 ├── types/           # TypeScript 类型定义
+│   └── index.ts     # FieldDiff / TemplateDiff / MigrationRecord / ImportWarning / ExportPayload 等
 ├── utils/           # 工具函数（权限、辅助函数）
 └── main.tsx         # 入口文件
 ```
@@ -161,8 +268,16 @@ src/
 
 - **User**：用户，含 role 角色和 storeId 门店归属
 - **Store**：门店，id / name / address
-- **Template**：检查模板，分类和检查项
-- **Issue**：问题，含状态、版本号、门店关联
-- **History**：操作历史，记录每次状态变更
-- **Conflict**：版本冲突，保留本地和远端版本
-- **SyncQueueItem**：同步队列项，含状态和错误信息
+- **Template**：检查模板，含 version（语义化版本）、deprecated、supersededBy、parentId
+- **TemplateField**：检查项，key / label / type / options / defaultValue
+- **FieldDiff**：字段差异，type ∈ {added, removed, modified, renamed, unchanged}
+- **TemplateDiff**：模板版本差异，含 summary 和 impactSummary
+- **MigrationOption**：迁移策略 'keep_old' | 'migrate' | 'new_only'
+- **FieldMapping**：字段映射 fromKey → toKey
+- **MigrationRecord**：迁移记录，含 fromVersion / toVersion / option / mappings / operatorId
+- **Issue**：问题，含 status、version、templateId、templateVersion、migrationSource
+- **History**：操作历史，含 action（新增 'migrate'）、templateVersion、migrationInfo
+- **Conflict**：版本冲突，含 templateVersionConflict（本地/远端版本号 + diff）
+- **SyncQueueItem**：同步队列项，含 templateVersionAtSync
+- **ImportWarning / ImportValidationResult**：导入校验结果（重复版本、缺字段、权限不足等）
+- **ExportPayload**：完整导出包，含 schemaVersion、migrations、unresolvedConflicts、所有实体

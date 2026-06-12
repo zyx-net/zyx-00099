@@ -19,6 +19,7 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'issue:view_all',
     'issue:reject',
     'config:import',
+    'template:upgrade',
     'export:data',
     'sync:manage',
     'conflict:resolve',
@@ -40,7 +41,7 @@ export const ROLE_LABELS: Record<UserRole, string> = {
 export const ROLE_DESCRIPTIONS: Record<UserRole, string> = {
   inspector: '创建并提交巡检问题，管理自己的草稿',
   manager: '查看门店问题，核实后关闭问题，导出记录',
-  supervisor: '导入配置，驳回问题，解决冲突，管理同步'
+  supervisor: '导入配置，升级模板，驳回问题，解决冲突，管理同步'
 };
 
 export function canManageIssue(user: User | null | undefined, issue: Issue | undefined, action: 'close' | 'reject'): boolean {
@@ -56,4 +57,8 @@ export function canManageIssue(user: User | null | undefined, issue: Issue | und
   }
 
   return false;
+}
+
+export function canUpgradeTemplate(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'template:upgrade');
 }

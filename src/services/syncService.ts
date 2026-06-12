@@ -1,5 +1,6 @@
-import { Issue, Conflict, SyncQueueItem } from '@/types';
+import { Issue, Conflict, SyncQueueItem, Template, Store, MigrationRecord } from '@/types';
 import { generateId } from '@/utils/helpers';
+import { buildExportPayload, generateCSVWithVersions, diffTemplateVersions } from './templateVersionService';
 
 const mockServerDB: Record<string, Issue> = {};
 
@@ -8,12 +9,32 @@ export interface SyncResult {
   conflict?: boolean;
   remoteVersion?: Issue;
   error?: string;
+  templateVersionMismatch?: {
+    localVersion: string;
+    remoteVersion: string;
+  };
 }
 
 export async function syncToServer(issue: Issue, simulateConflict = false): Promise<SyncResult> {
   await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 500));
 
   const existing = mockServerDB[issue.id];
+
+  if (existing) {
+    const localTplVer = issue.templateVersion || '1.0';
+    const remoteTplVer = existing.templateVersion || '1.0';
+    if (localTplVer !== remoteTplVer) {
+      return {
+        success: false,
+        conflict: true,
+        remoteVersion: { ...existing },
+        templateVersionMismatch: {
+          localVersion: localTplVer,
+          remoteVersion: remoteTplVer,
+        },
+      };
+    }
+  }
 
   if (simulateConflict || (existing && existing.version > issue.version)) {
     return {
@@ -28,14 +49,42 @@ export async function syncToServer(issue: Issue, simulateConflict = false): Prom
   return { success: true };
 }
 
-export function createConflict(localVersion: Issue, remoteVersion: Issue): Conflict {
+export function createConflict(
+  localVersion: Issue,
+  remoteVersion: Issue,
+  templates?: Template[]
+): Conflict {
+  let templateVersionConflict: Conflict['templateVersionConflict'] | undefined;
+
+  const localTplVer = localVersion.templateVersion || '1.0';
+  const remoteTplVer = remoteVersion.templateVersion || '1.0';
+
+  if (localTplVer !== remoteTplVer && templates) {
+    const localTpl = templates.find(t => t.id === localVersion.templateId);
+    const remoteTpl = templates.find(t => t.id === remoteVersion.templateId);
+    if (localTpl && remoteTpl) {
+      const diff = diffTemplateVersions(localTpl, remoteTpl, [localVersion, remoteVersion]);
+      templateVersionConflict = {
+        localTemplateVersion: localTplVer,
+        remoteTemplateVersion: remoteTplVer,
+        diff,
+      };
+    } else {
+      templateVersionConflict = {
+        localTemplateVersion: localTplVer,
+        remoteTemplateVersion: remoteTplVer,
+      };
+    }
+  }
+
   return {
     id: generateId(),
     issueId: localVersion.id,
     localVersion: { ...localVersion },
     remoteVersion: { ...remoteVersion },
     status: 'pending',
-    detectedAt: new Date().toISOString()
+    detectedAt: new Date().toISOString(),
+    templateVersionConflict,
   };
 }
 
@@ -46,33 +95,40 @@ export function createSyncQueueItem(issue: Issue, action: 'create' | 'update' | 
     action,
     status: 'pending',
     retryCount: 0,
-    payload: { ...issue }
+    payload: { ...issue },
+    templateVersionAtSync: issue.templateVersion || '1.0',
   };
 }
 
-export function exportToJSON(data: unknown): string {
-  return JSON.stringify(data, null, 2);
+export function exportToJSON(
+  data: {
+    issues: Issue[];
+    stores: Store[];
+    templates: Template[];
+    migrations?: MigrationRecord[];
+    unresolvedConflicts?: Conflict[];
+    exportedAt?: string;
+    exportedBy?: { id: string; role: any; name: string };
+  }
+): string {
+  const payload = buildExportPayload(
+    data.issues,
+    data.stores,
+    data.templates,
+    data.migrations || [],
+    data.unresolvedConflicts || [],
+    data.exportedBy as any
+  );
+  return JSON.stringify(payload, null, 2);
 }
 
-export function exportToCSV(issues: Issue[], stores: { id: string; name: string }[], templates: { id: string; name: string }[]): string {
-  const storeMap = new Map(stores.map(s => [s.id, s.name]));
-  const templateMap = new Map(templates.map(t => [t.id, t.name]));
-
-  const headers = ['问题编号', '标题', '门店', '模板', '状态', '优先级', '创建时间', '更新时间', '是否同步', '版本号'];
-  const rows = issues.map(issue => [
-    issue.id,
-    issue.title,
-    storeMap.get(issue.storeId) || issue.storeId,
-    templateMap.get(issue.templateId) || issue.templateId,
-    issue.status,
-    issue.priority || 'medium',
-    issue.createdAt,
-    issue.updatedAt,
-    issue.synced ? '是' : '否',
-    issue.version
-  ]);
-
-  return [headers, ...rows].map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+export function exportToCSV(
+  issues: Issue[],
+  stores: { id: string; name: string }[],
+  templates: Template[],
+  migrations: MigrationRecord[] = []
+): string {
+  return generateCSVWithVersions(issues, stores, templates, migrations);
 }
 
 export function downloadFile(content: string, filename: string, mimeType: string): void {
