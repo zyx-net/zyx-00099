@@ -7,6 +7,70 @@ export interface User {
   storeId?: string;
 }
 
+export type PlanSyncStatus = 'draft' | 'pending' | 'syncing' | 'failed' | 'completed';
+
+export interface PlanAttachment {
+  id: string;
+  name: string;
+  type: string;
+  size?: number;
+  url?: string;
+  placeholder?: boolean;
+  uploadedAt: string;
+  uploaderId: string;
+}
+
+export interface ReviewPlan {
+  id: string;
+  issueId: string;
+  reviewTime: string;
+  assigneeId: string;
+  assigneeName?: string;
+  assigneeRole?: UserRole;
+  rectificationNote: string;
+  attachments: PlanAttachment[];
+  creatorId: string;
+  creatorRole: UserRole;
+  version: number;
+  status: PlanSyncStatus;
+  synced: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastSyncError?: string;
+  lastSyncAttempt?: string;
+}
+
+export interface PlanConflict {
+  id: string;
+  planId: string;
+  issueId: string;
+  localPlan: ReviewPlan;
+  remotePlan: ReviewPlan;
+  status: 'pending' | 'resolved';
+  detectedAt: string;
+  resolution?: 'local' | 'remote' | 'merge';
+  resolvedAt?: string;
+  resolvedBy?: string;
+  resolvedByRole?: UserRole;
+}
+
+export type PlanHistoryAction =
+  | 'plan_create'
+  | 'plan_update'
+  | 'plan_delete'
+  | 'plan_conflict_resolve'
+  | 'plan_sync'
+  | 'plan_sync_fail';
+
+export interface PlanHistoryDetail {
+  field?: string;
+  oldValue?: any;
+  newValue?: any;
+  conflictResolution?: 'local' | 'remote' | 'merge';
+  localVersion?: ReviewPlan;
+  remoteVersion?: ReviewPlan;
+}
+
 export interface Store {
   id: string;
   name: string;
@@ -115,7 +179,15 @@ export interface Issue {
   };
 }
 
-export type HistoryAction = 'create' | 'update' | 'submit' | 'reject' | 'close' | 'reopen' | 'migrate';
+export type HistoryAction =
+  | 'create'
+  | 'update'
+  | 'submit'
+  | 'reject'
+  | 'close'
+  | 'reopen'
+  | 'migrate'
+  | PlanHistoryAction;
 
 export interface History {
   id: string;
@@ -133,6 +205,8 @@ export interface History {
     toVersion: string;
     migrationId: string;
   };
+  planId?: string;
+  planDetail?: PlanHistoryDetail;
 }
 
 export interface Conflict {
@@ -152,6 +226,7 @@ export interface Conflict {
 
 export type SyncStatus = 'pending' | 'syncing' | 'failed' | 'completed';
 export type SyncAction = 'create' | 'update' | 'delete';
+export type SyncEntityType = 'issue' | 'review_plan';
 
 export interface SyncQueueItem {
   id: string;
@@ -163,6 +238,8 @@ export interface SyncQueueItem {
   errorMessage?: string;
   payload: Issue;
   templateVersionAtSync?: string;
+  entityType?: SyncEntityType;
+  planPayload?: ReviewPlan;
 }
 
 export interface ToastMessage {
@@ -176,7 +253,11 @@ export type ImportWarningType =
   | 'duplicate_version'
   | 'missing_fields'
   | 'template_upgrade_available'
-  | 'permission_denied';
+  | 'permission_denied'
+  | 'duplicate_plan'
+  | 'plan_missing_assignee'
+  | 'plan_no_permission'
+  | 'plan_attachment_placeholder';
 
 export interface ImportWarning {
   type: ImportWarningType;
@@ -186,6 +267,8 @@ export interface ImportWarning {
   importVersion?: string;
   message: string;
   missingFields?: string[];
+  planId?: string;
+  issueId?: string;
 }
 
 export interface ImportValidationResult {
@@ -202,6 +285,8 @@ export interface ExportPayload {
   templates: Template[];
   migrations: MigrationRecord[];
   unresolvedConflicts: Conflict[];
+  reviewPlans: ReviewPlan[];
+  unresolvedPlanConflicts: PlanConflict[];
   exportedAt: string;
   exportedBy?: {
     id: string;

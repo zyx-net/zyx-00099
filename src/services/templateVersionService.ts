@@ -16,6 +16,8 @@ import {
   Store,
   User,
   UserRole,
+  ReviewPlan,
+  PlanConflict,
 } from '@/types';
 import { generateId } from '@/utils/helpers';
 
@@ -458,19 +460,31 @@ export function buildExportPayload(
   templates: Template[],
   migrations: MigrationRecord[],
   unresolvedConflicts: Conflict[],
-  currentUser?: User
+  currentUser?: User,
+  reviewPlans: ReviewPlan[] = [],
+  unresolvedPlanConflicts: PlanConflict[] = []
 ): ExportPayload {
+  const normalizedPlans = reviewPlans.map(plan => ({
+    ...plan,
+    attachments: (plan.attachments || []).map(att => ({
+      ...att,
+      url: undefined,
+      placeholder: true,
+    })),
+  }));
   return {
     issues,
     stores,
     templates,
     migrations,
     unresolvedConflicts,
+    reviewPlans: normalizedPlans,
+    unresolvedPlanConflicts,
     exportedAt: new Date().toISOString(),
     exportedBy: currentUser
       ? { id: currentUser.id, role: currentUser.role, name: currentUser.name }
       : undefined,
-    schemaVersion: '2.0',
+    schemaVersion: '3.0',
   };
 }
 
@@ -487,8 +501,8 @@ export function parseExportPayload(raw: any): {
     return { valid: false, warnings, errors: ['导入文件不是有效的 JSON 对象'] };
   }
 
-  if (raw.schemaVersion && raw.schemaVersion !== '2.0') {
-    warnings.push(`导入文件 schema 版本为 ${raw.schemaVersion}，当前版本 2.0，部分字段可能不兼容`);
+  if (raw.schemaVersion && raw.schemaVersion !== '3.0' && raw.schemaVersion !== '2.0') {
+    warnings.push(`导入文件 schema 版本为 ${raw.schemaVersion}，当前版本 3.0，部分字段可能不兼容`);
   }
 
   if (!Array.isArray(raw.issues)) errors.push('缺少 issues 数组');
@@ -497,6 +511,8 @@ export function parseExportPayload(raw: any): {
 
   if (!raw.migrations) warnings.push('导入文件不包含迁移记录');
   if (!raw.unresolvedConflicts) warnings.push('导入文件不包含未解决冲突记录');
+  if (!raw.reviewPlans) warnings.push('导入文件不包含复查整改计划');
+  if (!raw.unresolvedPlanConflicts) warnings.push('导入文件不包含复查计划冲突记录');
 
   if (errors.length > 0) {
     return { valid: false, warnings, errors };
@@ -511,6 +527,18 @@ export function parseExportPayload(raw: any): {
     }
   }
 
+  if (!payload.reviewPlans) payload.reviewPlans = [];
+  if (!payload.unresolvedPlanConflicts) payload.unresolvedPlanConflicts = [];
+
+  for (const plan of payload.reviewPlans) {
+    if (!plan.assigneeId) {
+      warnings.push(`复查计划 ${plan.id} 缺少责任人，需手动补全`);
+    }
+    if ((plan.attachments || []).some((a: any) => a.placeholder)) {
+      warnings.push(`复查计划 ${plan.id} 包含占位附件，需重新上传`);
+    }
+  }
+
   return { valid: true, payload, warnings, errors };
 }
 
@@ -518,11 +546,18 @@ export function generateCSVWithVersions(
   issues: Issue[],
   stores: { id: string; name: string }[],
   templates: Template[],
-  migrations: MigrationRecord[]
+  migrations: MigrationRecord[],
+  reviewPlans: ReviewPlan[] = []
 ): string {
   const storeMap = new Map(stores.map(s => [s.id, s.name]));
   const templateMap = new Map(templates.map(t => [t.id, t]));
   const migrationMap = new Map(migrations.map(m => [m.id, m]));
+  const plansByIssue = new Map<string, ReviewPlan[]>();
+  for (const plan of reviewPlans) {
+    const list = plansByIssue.get(plan.issueId) || [];
+    list.push(plan);
+    plansByIssue.set(plan.issueId, list);
+  }
 
   const headers = [
     '问题编号',
@@ -539,6 +574,10 @@ export function generateCSVWithVersions(
     '是否迁移过',
     '迁移来源版本',
     '迁移ID',
+    '复查计划数量',
+    '复查计划摘要',
+    '复查计划冲突数',
+    '附件占位信息',
   ];
 
   const rows = issues.map(issue => {
@@ -546,6 +585,13 @@ export function generateCSVWithVersions(
     const migration = issue.migrationSource
       ? migrationMap.get(issue.migrationSource.migrationId)
       : undefined;
+    const plans = plansByIssue.get(issue.id) || [];
+    const planSummary = plans.map(p =>
+      `[${p.assigneeName || p.assigneeId}|${p.reviewTime}|${p.status}]`
+    ).join('; ');
+    const attachmentPlaceholder = plans.some(p =>
+      (p.attachments || []).some(a => a.placeholder)
+    ) ? '含占位附件，需重新上传' : '';
     return [
       issue.id,
       issue.title,
@@ -561,6 +607,10 @@ export function generateCSVWithVersions(
       issue.migrationSource ? '是' : '否',
       issue.migrationSource?.fromTemplateVersion || '',
       issue.migrationSource?.migrationId || '',
+      plans.length,
+      planSummary,
+      0,
+      attachmentPlaceholder,
     ];
   });
 

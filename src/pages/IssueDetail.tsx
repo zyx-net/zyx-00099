@@ -1,15 +1,18 @@
 import { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/store';
-import { IssueStatus, Issue } from '@/types';
-import { hasPermission, canManageIssue } from '@/utils/permissions';
+import { IssueStatus, Issue, ReviewPlan, PlanConflict, PlanAttachment, UserRole } from '@/types';
+import { hasPermission, canManageIssue, canCreatePlan, canEditPlan, canResolvePlanConflict, canViewPlan } from '@/utils/permissions';
 import { IssueStatusBadge, PriorityBadge } from '@/components/StatusBadge';
-import { formatDate, ACTION_LABELS, getRoleName } from '@/utils/helpers';
+import { formatDate, ACTION_LABELS, getRoleName, PLAN_SYNC_STATUS_LABELS, PLAN_SYNC_STATUS_COLORS } from '@/utils/helpers';
 import {
   ArrowLeft, Store, Calendar, User, FileText, CloudOff, Cloud, AlertTriangle,
   CheckCircle, XCircle, Edit3, Image as ImageIcon, MessageSquare, AlertCircle,
-  History as HistoryIcon, GitBranch, Shield, RefreshCw, ArrowRight
+  History as HistoryIcon, GitBranch, Shield, RefreshCw, ArrowRight, Plus,
+  ClipboardCheck, Trash2, Save, X, File, ChevronDown, ChevronUp
 } from 'lucide-react';
+import { diffReviewPlans } from '@/services/syncService';
+import { generateId } from '@/utils/helpers';
 import { cn } from '@/lib/utils';
 
 export default function IssueDetail() {
@@ -17,12 +20,25 @@ export default function IssueDetail() {
   const navigate = useNavigate();
   const {
     issues, stores, templates, currentUser, histories, conflicts, migrations,
+    reviewPlans, planConflicts,
     updateIssueStatus, resolveConflict, addToast, getTemplateForIssue,
+    createReviewPlan, updateReviewPlan, deleteReviewPlan, resolvePlanConflict,
+    getReviewPlansForIssue,
   } = useAppStore();
 
   const [showConflict, setShowConflict] = useState(false);
   const [rejectRemark, setRejectRemark] = useState('');
   const [showRejectModal, setShowRejectModal] = useState(false);
+  const [showPlanForm, setShowPlanForm] = useState(false);
+  const [editingPlan, setEditingPlan] = useState<ReviewPlan | null>(null);
+  const [planForm, setPlanForm] = useState({
+    reviewTime: '',
+    assigneeId: '',
+    assigneeName: '',
+    assigneeRole: 'inspector' as UserRole,
+    rectificationNote: '',
+  });
+  const [showPlanConflict, setShowPlanConflict] = useState<string | null>(null);
 
   const issue = issues.find(i => i.id === id);
   const store = stores.find(s => s.id === issue?.storeId);
@@ -31,6 +47,91 @@ export default function IssueDetail() {
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
   const pendingConflict = conflicts.find(c => c.issueId === id && c.status === 'pending');
+
+  const visiblePlans = useMemo(() => {
+    if (!id) return [];
+    return getReviewPlansForIssue(id).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }, [id, reviewPlans, currentUser, issues]);
+
+  const issuePlanConflicts = useMemo(() =>
+    planConflicts.filter(pc => pc.issueId === id && pc.status === 'pending'),
+    [planConflicts, id]
+  );
+
+  const canAddPlan = issue ? canCreatePlan(currentUser, issue) : false;
+
+  const openCreatePlan = () => {
+    setEditingPlan(null);
+    setPlanForm({
+      reviewTime: new Date(Date.now() + 86400000).toISOString().slice(0, 16),
+      assigneeId: '',
+      assigneeName: '',
+      assigneeRole: 'inspector',
+      rectificationNote: '',
+    });
+    setShowPlanForm(true);
+  };
+
+  const openEditPlan = (plan: ReviewPlan) => {
+    if (!canEditPlan(currentUser, plan, issue)) {
+      addToast('error', '无权编辑此复查计划');
+      return;
+    }
+    setEditingPlan(plan);
+    setPlanForm({
+      reviewTime: plan.reviewTime.slice(0, 16),
+      assigneeId: plan.assigneeId,
+      assigneeName: plan.assigneeName || '',
+      assigneeRole: plan.assigneeRole || 'inspector',
+      rectificationNote: plan.rectificationNote,
+    });
+    setShowPlanForm(true);
+  };
+
+  const handleSubmitPlan = async () => {
+    if (!planForm.reviewTime) {
+      addToast('error', '请选择复查时间');
+      return;
+    }
+    if (!planForm.assigneeId && !planForm.assigneeName) {
+      addToast('error', '请指定复查责任人');
+      return;
+    }
+    const reviewTimeISO = new Date(planForm.reviewTime).toISOString();
+
+    if (editingPlan) {
+      const res = await updateReviewPlan(editingPlan.id, {
+        reviewTime: reviewTimeISO,
+        assigneeId: planForm.assigneeId || planForm.assigneeName,
+        assigneeName: planForm.assigneeName || planForm.assigneeId,
+        assigneeRole: planForm.assigneeRole,
+        rectificationNote: planForm.rectificationNote,
+      });
+      if (res.success) setShowPlanForm(false);
+    } else {
+      const res = await createReviewPlan({
+        issueId: id!,
+        reviewTime: reviewTimeISO,
+        assigneeId: planForm.assigneeId || planForm.assigneeName,
+        assigneeName: planForm.assigneeName || planForm.assigneeId,
+        assigneeRole: planForm.assigneeRole,
+        rectificationNote: planForm.rectificationNote,
+      });
+      if (res.success) setShowPlanForm(false);
+    }
+  };
+
+  const handleDeletePlan = async (planId: string) => {
+    if (!window.confirm('确定要删除此复查计划吗？')) return;
+    await deleteReviewPlan(planId);
+  };
+
+  const handleResolvePlanConflict = async (pcId: string, resolution: 'local' | 'remote' | 'merge') => {
+    await resolvePlanConflict(pcId, resolution);
+    setShowPlanConflict(null);
+  };
 
   const isCurrentTemplateLatest = useMemo(() => {
     if (!issue || !templates.length) return true;
@@ -451,6 +552,307 @@ export default function IssueDetail() {
         </div>
       </div>
 
+      <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+        <div className="p-6 border-b bg-gray-50 flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800 flex items-center gap-2">
+            <ClipboardCheck size={18} className="text-[#1e3a5f]" />
+            复查与整改计划
+            {issuePlanConflicts.length > 0 && (
+              <span className="text-xs px-2 py-0.5 bg-red-100 text-red-700 rounded-full">
+                {issuePlanConflicts.length} 个待处理冲突
+              </span>
+            )}
+          </h3>
+          {canAddPlan && (issue?.status === 'rejected' || issue?.status === 'submitted') && (
+            <button
+              onClick={openCreatePlan}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1e3a5f] text-white text-sm rounded-lg hover:bg-[#2d4a6f] transition-colors"
+            >
+              <Plus size={16} />
+              新建计划
+            </button>
+          )}
+        </div>
+
+        {issuePlanConflicts.length > 0 && issuePlanConflicts.map(pc => (
+          <div key={pc.id} className="bg-red-50 border-b border-red-200 p-4">
+            <div className="flex items-start justify-between gap-4 mb-3">
+              <div className="flex items-start gap-3">
+                <AlertTriangle className="text-red-500 mt-0.5" size={20} />
+                <div>
+                  <p className="font-medium text-red-800">复查计划版本冲突</p>
+                  <p className="text-sm text-red-600">本地与远程的复查时间或责任人不一致，需人工选择</p>
+                  <p className="text-xs text-red-500 mt-1">检测时间：{formatDate(pc.detectedAt)}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowPlanConflict(showPlanConflict === pc.id ? null : pc.id)}
+                className="text-red-600 hover:text-red-800 text-sm flex items-center gap-1"
+              >
+                {showPlanConflict === pc.id ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+                {showPlanConflict === pc.id ? '收起' : '查看差异'}
+              </button>
+            </div>
+
+            {showPlanConflict === pc.id && (() => {
+              const diffs = diffReviewPlans(pc.localPlan, pc.remotePlan);
+              const canResolve = canResolvePlanConflict(currentUser, pc.localPlan, issue);
+              return (
+                <div>
+                  <div className="bg-white rounded-lg overflow-hidden border border-red-200 mb-3">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="bg-red-100">
+                          <th className="px-3 py-2 text-left font-medium text-red-800">字段</th>
+                          <th className="px-3 py-2 text-left font-medium text-blue-700">本地版本</th>
+                          <th className="px-3 py-2 text-left font-medium text-orange-700">远程版本</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {diffs.length === 0 ? (
+                          <tr>
+                            <td colSpan={3} className="px-3 py-4 text-center text-gray-500">无实质差异</td>
+                          </tr>
+                        ) : diffs.map((d, i) => (
+                          <tr key={i} className="border-t">
+                            <td className="px-3 py-2 font-medium text-gray-700">{d.label}</td>
+                            <td className="px-3 py-2 bg-blue-50">{String(d.local ?? '-')}</td>
+                            <td className="px-3 py-2 bg-orange-50">{String(d.remote ?? '-')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {canResolve ? (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => handleResolvePlanConflict(pc.id, 'local')}
+                        className="flex-1 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm font-medium"
+                      >采用本地版本</button>
+                      <button
+                        onClick={() => handleResolvePlanConflict(pc.id, 'remote')}
+                        className="flex-1 py-2 bg-orange-600 text-white rounded hover:bg-orange-700 text-sm font-medium"
+                      >采用远程版本</button>
+                      <button
+                        onClick={() => handleResolvePlanConflict(pc.id, 'merge')}
+                        className="flex-1 py-2 bg-[#1e3a5f] text-white rounded hover:bg-[#2d4a6f] text-sm font-medium"
+                      >合并保留双方</button>
+                    </div>
+                  ) : (
+                    <p className="text-center text-sm text-red-600">请联系督导或创建人处理此冲突</p>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        ))}
+
+        <div className="p-6">
+          {visiblePlans.length === 0 ? (
+            <div className="text-center py-10 text-gray-500">
+              <ClipboardCheck size={40} className="mx-auto text-gray-300 mb-3" />
+              <p>暂无复查整改计划</p>
+              {canAddPlan && (issue?.status === 'rejected' || issue?.status === 'submitted') && (
+                <button
+                  onClick={openCreatePlan}
+                  className="mt-3 text-sm text-[#1e3a5f] hover:underline"
+                >+ 立即新建一个复查计划</button>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {visiblePlans.map(plan => {
+                const canEdit = canEditPlan(currentUser, plan, issue);
+                const hasConflict = issuePlanConflicts.some(pc => pc.planId === plan.id);
+                return (
+                  <div key={plan.id} className={cn(
+                    'border rounded-lg p-4 transition-colors',
+                    hasConflict ? 'border-red-200 bg-red-50/40' : 'border-gray-200'
+                  )}>
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 flex-wrap mb-1">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded text-white"
+                            style={{ backgroundColor: PLAN_SYNC_STATUS_COLORS[plan.status] }}>
+                            {PLAN_SYNC_STATUS_LABELS[plan.status]}
+                          </span>
+                          {plan.lastSyncError && (
+                            <span className="text-xs text-red-600 flex items-center gap-1">
+                              <AlertCircle size={12} /> {plan.lastSyncError}
+                            </span>
+                          )}
+                          {hasConflict && (
+                            <span className="text-xs text-red-600 flex items-center gap-1">
+                              <AlertTriangle size={12} /> 存在冲突
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-gray-400 font-mono">
+                          {plan.id.slice(0, 16)}... · 创建于 {formatDate(plan.createdAt)}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        {canEdit && (
+                          <>
+                            <button
+                              onClick={() => openEditPlan(plan)}
+                              className="p-1.5 text-gray-500 hover:text-[#1e3a5f] hover:bg-gray-100 rounded"
+                              title="编辑"
+                            >
+                              <Edit3 size={16} />
+                            </button>
+                            <button
+                              onClick={() => handleDeletePlan(plan.id)}
+                              className="p-1.5 text-gray-500 hover:text-red-600 hover:bg-red-50 rounded"
+                              title="删除"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4 text-sm">
+                      <div className="flex items-start gap-2">
+                        <Calendar size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p className="text-xs text-gray-500">复查时间</p>
+                          <p className="font-medium text-gray-800">{formatDate(plan.reviewTime)}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-start gap-2">
+                        <User size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p className="text-xs text-gray-500">责任人</p>
+                          <p className="font-medium text-gray-800">
+                            {plan.assigneeName || plan.assigneeId}
+                            {plan.assigneeRole && <span className="text-xs text-gray-500 ml-1">（{getRoleName(plan.assigneeRole)}）</span>}
+                          </p>
+                        </div>
+                      </div>
+                      {plan.rectificationNote && (
+                        <div className="col-span-2 flex items-start gap-2">
+                          <FileText size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                          <div className="flex-1">
+                            <p className="text-xs text-gray-500">整改说明</p>
+                            <p className="text-gray-700 whitespace-pre-wrap">{plan.rectificationNote}</p>
+                          </div>
+                        </div>
+                      )}
+                      {plan.attachments && plan.attachments.length > 0 && (
+                        <div className="col-span-2 flex items-start gap-2">
+                          <File size={16} className="text-gray-400 mt-0.5 flex-shrink-0" />
+                          <div className="flex-1">
+                            <p className="text-xs text-gray-500 mb-1">附件 ({plan.attachments.length})</p>
+                            <div className="flex flex-wrap gap-2">
+                              {plan.attachments.map(att => (
+                                <span key={att.id} className="inline-flex items-center gap-1 px-2 py-1 bg-gray-50 border border-gray-200 rounded text-xs">
+                                  <File size={12} />
+                                  {att.name}
+                                  {att.placeholder && <span className="text-orange-600">（占位）</span>}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {showPlanForm && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div className="p-5 border-b flex items-center justify-between">
+              <h3 className="font-bold text-lg text-gray-900">
+                {editingPlan ? '编辑复查计划' : '新建复查计划'}
+              </h3>
+              <button
+                onClick={() => setShowPlanForm(false)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">复查时间 *</label>
+                <input
+                  type="datetime-local"
+                  value={planForm.reviewTime}
+                  onChange={e => setPlanForm(f => ({ ...f, reviewTime: e.target.value }))}
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">责任人姓名 *</label>
+                  <input
+                    type="text"
+                    value={planForm.assigneeName}
+                    onChange={e => setPlanForm(f => ({ ...f, assigneeName: e.target.value }))}
+                    placeholder="请输入责任人姓名"
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1.5">角色</label>
+                  <select
+                    value={planForm.assigneeRole}
+                    onChange={e => setPlanForm(f => ({ ...f, assigneeRole: e.target.value as UserRole }))}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40"
+                  >
+                    <option value="inspector">巡检员</option>
+                    <option value="manager">店长</option>
+                    <option value="supervisor">督导</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">责任人 ID</label>
+                <input
+                  type="text"
+                  value={planForm.assigneeId}
+                  onChange={e => setPlanForm(f => ({ ...f, assigneeId: e.target.value }))}
+                  placeholder="选填，可留空"
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1.5">整改说明</label>
+                <textarea
+                  rows={4}
+                  value={planForm.rectificationNote}
+                  onChange={e => setPlanForm(f => ({ ...f, rectificationNote: e.target.value }))}
+                  placeholder="请描述整改要求和注意事项..."
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#1e3a5f]/40 resize-none"
+                />
+              </div>
+            </div>
+            <div className="p-5 border-t bg-gray-50 flex gap-3 justify-end">
+              <button
+                onClick={() => setShowPlanForm(false)}
+                className="px-4 py-2 bg-white text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
+              >取消</button>
+              <button
+                onClick={handleSubmitPlan}
+                className="px-4 py-2 bg-[#1e3a5f] text-white rounded-lg hover:bg-[#2d4a6f] flex items-center gap-2"
+              >
+                <Save size={16} />
+                {editingPlan ? '保存修改' : '创建计划'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="bg-white rounded-xl border border-gray-200 p-6">
         <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
           <HistoryIcon size={18} />
@@ -471,11 +873,14 @@ export default function IssueDetail() {
                     history.action === 'close' ? 'bg-green-100' :
                     history.action === 'reject' ? 'bg-red-100' :
                     history.action === 'submit' ? 'bg-blue-100' :
-                    history.action === 'migrate' ? 'bg-purple-100' : 'bg-gray-100'
+                    history.action === 'migrate' ? 'bg-purple-100' :
+                    String(history.action).startsWith('plan_') ? 'bg-teal-100' :
+                    'bg-gray-100'
                   )}>
                     {history.action === 'close' ? <CheckCircle size={14} className="text-green-600" /> :
                      history.action === 'reject' ? <XCircle size={14} className="text-red-600" /> :
                      history.action === 'migrate' ? <GitBranch size={14} className="text-purple-600" /> :
+                     String(history.action).startsWith('plan_') ? <ClipboardCheck size={14} className="text-teal-600" /> :
                      <Edit3 size={14} className="text-gray-600" />}
                   </div>
                   {idx !== issueHistories.length - 1 && (
@@ -513,6 +918,31 @@ export default function IssueDetail() {
                     <p className="mt-2 text-sm text-gray-600 bg-gray-50 rounded p-3">
                       {history.remark}
                     </p>
+                  )}
+                  {history.planDetail && (
+                    <div className="mt-2 text-xs text-gray-600 bg-teal-50 border border-teal-100 rounded p-3">
+                      <p className="font-medium text-teal-700 mb-1.5">复查计划变更</p>
+                      <div className="space-y-1">
+                        {history.planDetail.reviewTimeBefore !== undefined && (
+                          <p>复查时间：{history.planDetail.reviewTimeBefore || '-'} → {history.planDetail.reviewTimeAfter || '-'}</p>
+                        )}
+                        {history.planDetail.assigneeBefore !== undefined && (
+                          <p>责任人：{history.planDetail.assigneeBefore || '-'} → {history.planDetail.assigneeAfter || '-'}</p>
+                        )}
+                        {history.planDetail.noteBefore !== undefined && (
+                          <p>整改说明：{String(history.planDetail.noteBefore || '').slice(0, 40)} → {String(history.planDetail.noteAfter || '').slice(0, 40)}</p>
+                        )}
+                        {history.planDetail.conflictResolution && (
+                          <p>冲突解决方式：{history.planDetail.conflictResolution === 'local' ? '采用本地' : history.planDetail.conflictResolution === 'remote' ? '采用远程' : '合并保留双方'}</p>
+                        )}
+                        {history.planDetail.syncError && (
+                          <p className="text-red-600">同步失败：{history.planDetail.syncError}</p>
+                        )}
+                        {history.planDetail.version && (
+                          <p>版本：{history.planDetail.version}</p>
+                        )}
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>

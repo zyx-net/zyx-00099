@@ -1,4 +1,4 @@
-import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole } from '@/types';
+import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus } from '@/types';
 
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -62,6 +62,22 @@ export const SYNC_STATUS_COLORS: Record<SyncStatus, string> = {
   completed: 'bg-green-500'
 };
 
+export const PLAN_SYNC_STATUS_LABELS: Record<PlanSyncStatus, string> = {
+  draft: '草稿',
+  pending: '待同步',
+  syncing: '同步中',
+  failed: '同步失败',
+  completed: '已完成'
+};
+
+export const PLAN_SYNC_STATUS_COLORS: Record<PlanSyncStatus, string> = {
+  draft: 'bg-gray-500',
+  pending: 'bg-yellow-500',
+  syncing: 'bg-blue-500',
+  failed: 'bg-red-500',
+  completed: 'bg-green-500'
+};
+
 export const ACTION_LABELS: Record<HistoryAction, string> = {
   create: '创建',
   update: '更新',
@@ -69,7 +85,13 @@ export const ACTION_LABELS: Record<HistoryAction, string> = {
   reject: '驳回',
   close: '关闭',
   reopen: '重新打开',
-  migrate: '迁移'
+  migrate: '迁移',
+  plan_create: '创建复查计划',
+  plan_update: '更新复查计划',
+  plan_delete: '删除复查计划',
+  plan_conflict_resolve: '解决复查计划冲突',
+  plan_sync: '复查计划同步成功',
+  plan_sync_fail: '复查计划同步失败',
 };
 
 export function getRoleName(role: UserRole): string {

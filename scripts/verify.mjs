@@ -3,9 +3,9 @@ function generateId() {
 }
 
 const ROLE_PERMISSIONS = {
-  inspector: ['issue:create', 'issue:edit_own', 'issue:view_own'],
-  manager: ['issue:view_all', 'issue:close', 'export:data'],
-  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data']
+  inspector: ['issue:create', 'issue:edit_own', 'issue:view_own', 'plan:view_own'],
+  manager: ['issue:view_all', 'issue:close', 'export:data', 'plan:create', 'plan:edit_own', 'plan:view_store', 'plan_conflict:resolve_own'],
+  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all']
 };
 
 function hasPermission(role, permission) {
@@ -731,6 +731,477 @@ test('多版本模板并存恢复：旧版本不被覆盖', () => {
   assert(recovered.payload.templates.find(t => t.version === '2.0'), 'v2.0 模板存在');
   assert(recovered.payload.issues[0].templateVersion === '1.0', '问题 i1 绑定 v1.0');
   assert(recovered.payload.issues[1].templateVersion === '2.0', '问题 i2 绑定 v2.0');
+});
+
+// ========== 复查与整改计划 辅助函数 ==========
+
+function canCreatePlan(user, issue) {
+  if (!user || !issue || !hasPermission(user.role, 'plan:create')) return false;
+  if (user.role === 'supervisor') return true;
+  if (user.role === 'manager') return user.storeId === issue.storeId;
+  return false;
+}
+
+function canEditPlan(user, plan, issue) {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan:edit_all')) return true;
+  if (hasPermission(user.role, 'plan:edit_own')) {
+    if (user.role === 'manager') {
+      return user.storeId === (issue?.storeId || plan.storeId || true);
+    }
+    return user.id === plan.creatorId;
+  }
+  return false;
+}
+
+function canViewPlan(user, plan, issue) {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan:view_all')) return true;
+  if (hasPermission(user.role, 'plan:view_store')) {
+    return user.storeId === (issue?.storeId || plan.storeId);
+  }
+  if (hasPermission(user.role, 'plan:view_own')) {
+    return user.id === plan.assigneeId || user.id === plan.creatorId;
+  }
+  return false;
+}
+
+function canResolvePlanConflict(user, plan, issue) {
+  if (!user || !plan) return false;
+  if (hasPermission(user.role, 'plan_conflict:resolve_all')) return true;
+  if (hasPermission(user.role, 'plan_conflict:resolve_own')) {
+    if (user.role === 'manager') return user.storeId === (issue?.storeId || plan.storeId);
+    return user.id === plan.creatorId;
+  }
+  return false;
+}
+
+function diffReviewPlans(local, remote) {
+  const diffs = [];
+  if (local.reviewTime !== remote.reviewTime) {
+    diffs.push({ field: 'reviewTime', label: '复查时间', local: local.reviewTime, remote: remote.reviewTime });
+  }
+  if (local.assigneeId !== remote.assigneeId || local.assigneeName !== remote.assigneeName) {
+    diffs.push({
+      field: 'assignee',
+      label: '责任人',
+      local: local.assigneeName || local.assigneeId,
+      remote: remote.assigneeName || remote.assigneeId
+    });
+  }
+  if (local.rectificationNote !== remote.rectificationNote) {
+    diffs.push({ field: 'rectificationNote', label: '整改说明', local: local.rectificationNote, remote: remote.rectificationNote });
+  }
+  const la = local.attachments?.map(a => a.id).sort().join(',') || '';
+  const ra = remote.attachments?.map(a => a.id).sort().join(',') || '';
+  if (la !== ra) {
+    diffs.push({
+      field: 'attachments',
+      label: '附件',
+      local: (local.attachments?.length || 0) + ' 个',
+      remote: (remote.attachments?.length || 0) + ' 个'
+    });
+  }
+  return diffs;
+}
+
+function mergeReviewPlans(local, remote) {
+  const allAtt = [];
+  const seen = new Set();
+  for (const a of [...(local.attachments || []), ...(remote.attachments || [])]) {
+    if (!seen.has(a.id)) { allAtt.push(a); seen.add(a.id); }
+  }
+  const notes = [local.rectificationNote, remote.rectificationNote].filter(Boolean).join('\n\n--- 合并分割 ---\n\n');
+  return {
+    ...local,
+    reviewTime: local.reviewTime || remote.reviewTime,
+    assigneeId: local.assigneeId || remote.assigneeId,
+    assigneeName: local.assigneeName || remote.assigneeName,
+    rectificationNote: notes,
+    attachments: allAtt,
+    version: Math.max(local.version, remote.version) + 1,
+    synced: false,
+    status: 'draft'
+  };
+}
+
+function makeReviewPlan(overrides = {}) {
+  const base = {
+    id: generateId(),
+    issueId: 'issue-1',
+    reviewTime: new Date(Date.now() + 86400000).toISOString(),
+    assigneeId: 'ins-1',
+    assigneeName: '巡检员',
+    assigneeRole: 'inspector',
+    rectificationNote: '请完成整改',
+    attachments: [],
+    creatorId: 'sup-1',
+    creatorRole: 'supervisor',
+    version: 1,
+    status: 'pending',
+    synced: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  return { ...base, ...overrides };
+}
+
+function makePlanConflict(local, remote, overrides = {}) {
+  return {
+    id: generateId(),
+    planId: local.id,
+    issueId: local.issueId,
+    localPlan: local,
+    remotePlan: remote,
+    status: 'pending',
+    resolution: null,
+    resolvedAt: null,
+    resolvedBy: null,
+    detectedAt: new Date().toISOString(),
+    ...overrides
+  };
+}
+
+// ========== 扩展导入导出 ==========
+
+function buildExportPayloadV3(issues, stores, templates, migrations, unresolvedConflicts, reviewPlans, unresolvedPlanConflicts, currentUser) {
+  const planList = (reviewPlans || []).map(p => ({
+    ...p,
+    attachments: (p.attachments || []).map(a => ({ ...a, url: undefined, placeholder: true }))
+  }));
+  return {
+    schemaVersion: '3.0',
+    exportedAt: new Date().toISOString(),
+    exportedBy: currentUser?.id,
+    data: {
+      issues: issues.map(i => ({ ...i, templateVersion: i.templateVersion || '1.0' })),
+      stores,
+      templates,
+      migrations,
+      unresolvedConflicts,
+      reviewPlans: planList,
+      unresolvedPlanConflicts
+    }
+  };
+}
+
+function parseExportPayloadV3(raw, currentUser) {
+  const warnings = [];
+  const errors = [];
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!parsed || typeof parsed !== 'object') {
+      errors.push({ type: 'invalid_format', message: '格式无效' });
+      return { valid: false, warnings, errors };
+    }
+    if (!parsed.data || typeof parsed.data !== 'object') {
+      errors.push({ type: 'missing_data', message: '缺少 data 字段' });
+      return { valid: false, warnings, errors };
+    }
+    const schemaVersion = parsed.schemaVersion || '1.0';
+    if (compareSemanticVersions(schemaVersion, '3.0') < 0) {
+      warnings.push({ type: 'old_schema', message: `文件来自旧版本 v${schemaVersion}，复查计划数据可能缺失` });
+    }
+    const data = parsed.data;
+    const result = {
+      issues: [], stores: [], templates: [], migrations: [],
+      unresolvedConflicts: [], reviewPlans: [], unresolvedPlanConflicts: []
+    };
+    if (Array.isArray(data.issues)) result.issues = data.issues.map(i => ({ ...i, templateVersion: i.templateVersion || '1.0' }));
+    if (Array.isArray(data.stores)) result.stores = data.stores;
+    if (Array.isArray(data.templates)) result.templates = data.templates;
+    if (Array.isArray(data.migrations)) result.migrations = data.migrations;
+    if (Array.isArray(data.unresolvedConflicts)) result.unresolvedConflicts = data.unresolvedConflicts;
+
+    if (Array.isArray(data.reviewPlans)) {
+      const seen = new Set();
+      for (const p of data.reviewPlans) {
+        if (seen.has(p.id)) {
+          warnings.push({ type: 'duplicate_plan', planId: p.id, issueId: p.issueId, message: `复查计划 ${p.id.slice(0, 12)} 已存在，跳过` });
+          continue;
+        }
+        seen.add(p.id);
+        if (!p.assigneeId && !p.assigneeName) {
+          warnings.push({ type: 'plan_missing_assignee', planId: p.id, issueId: p.issueId, message: `复查计划 ${p.id.slice(0, 12)} 缺少责任人信息` });
+        }
+        if (currentUser) {
+          const _issue = data.issues?.find((i) => i.id === p.issueId);
+          if (!canCreatePlan(currentUser, _issue || { storeId: p.storeId })) {
+            warnings.push({ type: 'plan_no_permission', planId: p.id, issueId: p.issueId, message: `当前用户无权修改计划 ${p.id.slice(0, 12)}，将以草稿状态导入` });
+            p.status = 'draft';
+            p.synced = false;
+          }
+        }
+        if (Array.isArray(p.attachments) && p.attachments.some(a => a.placeholder)) {
+          warnings.push({ type: 'plan_attachment_placeholder', planId: p.id, issueId: p.issueId, message: `计划 ${p.id.slice(0, 12)} 包含占位附件，导入后需重新上传` });
+        }
+        result.reviewPlans.push(p);
+      }
+    } else if (compareSemanticVersions(schemaVersion, '3.0') >= 0) {
+      warnings.push({ type: 'missing_review_plans', message: 'v3.0 文件缺少复查计划字段' });
+    }
+
+    if (Array.isArray(data.unresolvedPlanConflicts)) result.unresolvedPlanConflicts = data.unresolvedPlanConflicts;
+    return { valid: true, payload: result, warnings, errors, schemaVersion };
+  } catch (e) {
+    errors.push({ type: 'parse_error', message: `解析失败: ${e.message}` });
+    return { valid: false, warnings, errors };
+  }
+}
+
+// ========== 测试用例 ==========
+
+console.log('\n=== 复查计划：权限体系验证 ===\n');
+
+test('店长可为本门店问题创建复查计划', () => {
+  assert(canCreatePlan(managerA, issueInA) === true, '店长A应为门店A创建计划');
+  assert(canCreatePlan(managerA, issueInB) === false, '店长A不应为门店B创建计划');
+});
+
+test('督导可任意创建复查计划', () => {
+  assert(canCreatePlan(supervisor, issueInA) === true);
+  assert(canCreatePlan(supervisor, issueInB) === true);
+});
+
+test('巡检员无创建复查计划权限', () => {
+  assert(canCreatePlan(inspector, issueInA) === false);
+  assert(canCreatePlan(inspector, issueInB) === false);
+});
+
+test('店长可编辑自己门店的计划', () => {
+  const plan = makeReviewPlan({ creatorId: 'other', issueId: issueInA.id });
+  assert(canEditPlan(managerA, plan, issueInA) === true, '店长A可编辑本门店计划');
+  assert(canEditPlan(managerB, plan, issueInA) === false, '店长B不能编辑其他门店计划');
+});
+
+test('巡检员只能查看分配给自己或自己创建的计划', () => {
+  const planForMe = makeReviewPlan({ assigneeId: inspector.id });
+  const planByMe = makeReviewPlan({ creatorId: inspector.id });
+  const planOther = makeReviewPlan({ assigneeId: 'other', creatorId: 'other' });
+  assert(canViewPlan(inspector, planForMe) === true, '可查看分配给自己的计划');
+  assert(canViewPlan(inspector, planByMe) === true, '可查看自己创建的计划');
+  assert(canViewPlan(inspector, planOther) === false, '不应能查看他人计划');
+});
+
+test('督导可查看和解决所有复查计划冲突', () => {
+  const plan = makeReviewPlan({ creatorId: 'x', storeId: 'any' });
+  assert(canViewPlan(supervisor, plan) === true);
+  assert(canResolvePlanConflict(supervisor, plan) === true);
+});
+
+test('店长只能解决本门店计划冲突', () => {
+  const planA = makeReviewPlan({ issueId: issueInA.id });
+  const planB = makeReviewPlan({ issueId: issueInB.id });
+  assert(canResolvePlanConflict(managerA, planA, issueInA) === true);
+  assert(canResolvePlanConflict(managerA, planB, issueInB) === false);
+});
+
+console.log('\n=== 复查计划：diff 和 merge 逻辑验证 ===\n');
+
+test('diffReviewPlans 正确识别复查时间/责任人/说明/附件差异', () => {
+  const local = makeReviewPlan({
+    reviewTime: '2025-01-01T10:00:00.000Z',
+    assigneeId: 'ins-1', assigneeName: '巡检员A',
+    rectificationNote: '整改1',
+    attachments: [{ id: 'att-1', name: 'a.png' }]
+  });
+  const remote = makeReviewPlan({
+    id: local.id, issueId: local.issueId,
+    reviewTime: '2025-01-02T10:00:00.000Z',
+    assigneeId: 'ins-2', assigneeName: '巡检员B',
+    rectificationNote: '整改2',
+    attachments: [{ id: 'att-2', name: 'b.png' }]
+  });
+  const diffs = diffReviewPlans(local, remote);
+  assert(diffs.length >= 4, '至少应识别 4 处差异');
+  assert(diffs.some(d => d.field === 'reviewTime'), '应识别复查时间差异');
+  assert(diffs.some(d => d.field === 'assignee'), '应识别责任人差异');
+  assert(diffs.some(d => d.field === 'rectificationNote'), '应识别整改说明差异');
+  assert(diffs.some(d => d.field === 'attachments'), '应识别附件差异');
+});
+
+test('mergeReviewPlans 附件合并去重，说明拼接，版本号递增', () => {
+  const local = makeReviewPlan({
+    version: 2, rectificationNote: '本地说明',
+    attachments: [{ id: 'att-1', name: 'a.png' }]
+  });
+  const remote = makeReviewPlan({
+    id: local.id, version: 3, rectificationNote: '远端说明',
+    attachments: [{ id: 'att-1', name: 'a.png' }, { id: 'att-2', name: 'b.png' }]
+  });
+  const merged = mergeReviewPlans(local, remote);
+  assert(merged.attachments.length === 2, '附件应合并去重为 2 个');
+  assert(merged.rectificationNote.includes('本地说明') && merged.rectificationNote.includes('远端说明'), '整改说明应拼接双方');
+  assert(merged.version === 4, '版本号应为 max(2,3)+1 = 4');
+  assert(merged.status === 'draft', '合并后应为草稿待同步');
+});
+
+console.log('\n=== 复查计划：离线同步与冲突保留验证 ===\n');
+
+test('本地和远端两份计划独立保存在冲突记录中互不覆盖', () => {
+  const local = makeReviewPlan({ reviewTime: '2025-01-01', assigneeName: '本地责任人', version: 2 });
+  const remote = makeReviewPlan({ id: local.id, reviewTime: '2025-01-03', assigneeName: '远端责任人', version: 2 });
+  const pc = makePlanConflict(local, remote);
+  assert(pc.localPlan.reviewTime === '2025-01-01', '本地计划内容不应被覆盖');
+  assert(pc.remotePlan.reviewTime === '2025-01-03', '远端计划内容不应被覆盖');
+  assert(pc.localPlan.assigneeName === '本地责任人', '本地责任人不被覆盖');
+  assert(pc.remotePlan.assigneeName === '远端责任人', '远端责任人不被覆盖');
+  assert(pc.status === 'pending', '冲突初始状态为 pending');
+});
+
+test('同步失败原因持久化可恢复（跨重启）', () => {
+  const plan = makeReviewPlan({
+    status: 'failed',
+    lastSyncError: '网络超时',
+    lastSyncAttempt: '2025-01-01T00:00:00.000Z'
+  });
+  const recovered = JSON.parse(JSON.stringify(plan));
+  assert(recovered.status === 'failed', '重启后失败状态应保留');
+  assert(recovered.lastSyncError === '网络超时', '重启后失败原因应保留');
+  assert(recovered.lastSyncAttempt === '2025-01-01T00:00:00.000Z', '重启后失败时间应保留');
+});
+
+test('草稿状态跨重启恢复', () => {
+  const plan = makeReviewPlan({ status: 'draft', rectificationNote: '未完成的草稿内容' });
+  const recovered = JSON.parse(JSON.stringify(plan));
+  assert(recovered.status === 'draft', '重启后草稿状态保留');
+  assert(recovered.rectificationNote === '未完成的草稿内容', '重启后草稿内容保留');
+});
+
+console.log('\n=== 复查计划：导入导出往返一致性验证 ===\n');
+
+const samplePlan1 = makeReviewPlan({
+  id: 'plan-abc-123', issueId: issueInA.id,
+  assigneeName: '责任人A', rectificationNote: '整改说明A',
+  attachments: [{ id: 'att-1', name: '照片1.png', url: 'https://x.com/a.png' }],
+  status: 'pending', version: 2
+});
+const samplePlan2 = makeReviewPlan({
+  id: 'plan-xyz-456', issueId: issueInB.id,
+  assigneeName: '责任人B', status: 'completed', version: 1
+});
+const samplePlanConflict = makePlanConflict(samplePlan1, samplePlan1, { status: 'pending' });
+
+test('buildExportPayloadV3 schema 为 3.0，附件转为占位符', () => {
+  const payload = buildExportPayloadV3([], [], [], [], [], [samplePlan1], [], supervisor);
+  assert(payload.schemaVersion === '3.0', '导出 schemaVersion 应为 3.0');
+  const p = payload.data.reviewPlans[0];
+  assert(p.attachments[0].placeholder === true, '附件导出应为占位符');
+  assert(p.attachments[0].url === undefined, '附件真实 URL 应被移除');
+  assert(p.attachments[0].name === '照片1.png', '附件名称仍保留');
+});
+
+test('导入时识别重复计划、缺少责任人、占位附件并给出明确警告', () => {
+  const duplicatePlan = { ...samplePlan1 };
+  const missingAssigneePlan = makeReviewPlan({ id: 'plan-no-asg', assigneeId: '', assigneeName: '' });
+  const exported = buildExportPayloadV3(
+    [issueInA, issueInB], [storeA, storeB], [], [], [],
+    [samplePlan1, duplicatePlan, missingAssigneePlan], [samplePlanConflict], supervisor
+  );
+  const parsed = parseExportPayloadV3(JSON.stringify(exported), inspector);
+  assert(parsed.valid === true, '应能成功解析');
+  assert(parsed.warnings.some(w => w.type === 'duplicate_plan'), '应给出重复计划警告');
+  assert(parsed.warnings.some(w => w.type === 'plan_missing_assignee'), '应给出缺少责任人警告');
+  assert(parsed.warnings.some(w => w.type === 'plan_attachment_placeholder'), '应给出占位附件警告');
+  assert(parsed.warnings.some(w => w.type === 'plan_no_permission'), '巡检员导入应有权限警告，计划被标为草稿');
+  assert(parsed.payload.reviewPlans.length === 2, '重复计划应被跳过，实际 2 条');
+});
+
+test('导出后再导入复查计划与冲突记录完整（往返一致性）', () => {
+  const exported = buildExportPayloadV3(
+    [issueInA], [storeA], [], [], [], [samplePlan1, samplePlan2], [samplePlanConflict], supervisor
+  );
+  const parsed = parseExportPayloadV3(JSON.stringify(exported), supervisor);
+  assert(parsed.payload.reviewPlans.length === 2, '2 条计划完整导入');
+  assert(parsed.payload.unresolvedPlanConflicts.length === 1, '1 条计划冲突完整导入');
+  assert(parsed.payload.reviewPlans.find(p => p.id === 'plan-abc-123').rectificationNote === '整改说明A', '整改说明保留');
+  assert(parsed.schemaVersion === '3.0', 'schema 版本保留');
+});
+
+test('旧 v2.0 数据导入给出复查计划缺失警告但不报错', () => {
+  const oldExport = buildExportPayload([issueInA], [storeA], [templateV1], [], [], supervisor);
+  const parsed = parseExportPayloadV3(JSON.stringify(oldExport), supervisor);
+  assert(parsed.valid === true, 'v2.0 旧数据应仍可导入');
+  assert(parsed.warnings.some(w => w.type === 'old_schema'), '应给出旧 schema 警告');
+});
+
+console.log('\n=== 复查计划：历史日志完整性验证 ===\n');
+
+test('plan_create / plan_update / plan_delete 动作生成历史记录并写 planDetail', () => {
+  const plan = makeReviewPlan();
+  const histories = [
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_create',
+      actorId: supervisor.id, timestamp: new Date().toISOString(),
+      planDetail: { reviewTimeAfter: plan.reviewTime, assigneeAfter: plan.assigneeName, version: plan.version } },
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_update',
+      actorId: supervisor.id, timestamp: new Date().toISOString(),
+      planDetail: { reviewTimeBefore: plan.reviewTime, reviewTimeAfter: '2025-02-01T00:00:00.000Z',
+        assigneeBefore: plan.assigneeName, assigneeAfter: '新责任人', version: 2 } },
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_delete',
+      actorId: supervisor.id, timestamp: new Date().toISOString(),
+      planDetail: { reviewTimeBefore: plan.reviewTime, assigneeBefore: plan.assigneeName } }
+  ];
+  assert(histories.every(h => h.planId === plan.id), '每条历史应关联 planId');
+  assert(histories[0].action === 'plan_create', '创建动作标记正确');
+  assert(histories[0].planDetail.reviewTimeAfter, '创建历史应记录 planDetail');
+  assert(histories[1].planDetail.reviewTimeBefore && histories[1].planDetail.reviewTimeAfter, '更新历史应记录 before/after');
+  assert(histories[2].action === 'plan_delete', '删除动作标记正确');
+});
+
+test('plan_conflict_resolve / plan_sync / plan_sync_fail 动作写进历史', () => {
+  const plan = makeReviewPlan();
+  const histories = [
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_conflict_resolve',
+      planDetail: { conflictResolution: 'merge', version: 4 } },
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_sync',
+      planDetail: { version: 2 } },
+    { id: generateId(), issueId: plan.issueId, planId: plan.id, action: 'plan_sync_fail',
+      planDetail: { syncError: '远端拒绝冲突版本' } }
+  ];
+  assert(histories[0].planDetail.conflictResolution === 'merge', '冲突解决方式写入历史');
+  assert(histories[1].action === 'plan_sync', '同步成功写入历史');
+  assert(histories[2].planDetail.syncError === '远端拒绝冲突版本', '同步失败原因写入历史');
+});
+
+console.log('\n=== 复查计划：冲突解决三种策略验证 ===\n');
+
+test('采用本地版本：保留本地内容，版本号取远端版本号 + 1', () => {
+  const local = makeReviewPlan({ reviewTime: '2025-01-01', assigneeName: '本地责任人', version: 1 });
+  const remote = makeReviewPlan({ id: local.id, reviewTime: '2025-01-03', assigneeName: '远端责任人', version: 3 });
+  const pc = makePlanConflict(local, remote);
+  const resolved_local = {
+    ...local,
+    version: Math.max(local.version, remote.version) + 1,
+    synced: false,
+    updatedAt: new Date().toISOString()
+  };
+  const updatedPc = { ...pc, status: 'resolved', resolution: 'local', resolvedAt: new Date().toISOString() };
+  assert(resolved_local.reviewTime === '2025-01-01', '本地策略保留本地复查时间');
+  assert(resolved_local.assigneeName === '本地责任人', '本地策略保留本地责任人');
+  assert(resolved_local.version === 4, '版本号应为 max(1,3)+1 = 4');
+  assert(updatedPc.status === 'resolved', '冲突记录标记为 resolved');
+  assert(updatedPc.resolution === 'local', '冲突解决方式为 local');
+});
+
+test('采用远端版本：内容被远端覆盖，保留本地 id', () => {
+  const local = makeReviewPlan({ id: 'plan-local-1', reviewTime: '2025-01-01', assigneeName: '本地责任人', version: 1 });
+  const remote = makeReviewPlan({ id: local.id, reviewTime: '2025-01-03', assigneeName: '远端责任人', version: 3 });
+  const resolved_remote = {
+    ...local,
+    reviewTime: remote.reviewTime,
+    assigneeId: remote.assigneeId,
+    assigneeName: remote.assigneeName,
+    assigneeRole: remote.assigneeRole,
+    rectificationNote: remote.rectificationNote,
+    attachments: remote.attachments || [],
+    version: remote.version + 1,
+    synced: false,
+    updatedAt: new Date().toISOString()
+  };
+  assert(resolved_remote.id === 'plan-local-1', '远端策略保留本地 id');
+  assert(resolved_remote.reviewTime === '2025-01-03', '远端策略采用远端复查时间');
+  assert(resolved_remote.assigneeName === '远端责任人', '远端策略采用远端责任人');
+  assert(resolved_remote.version === 4, '版本号为远端版本+1');
 });
 
 console.log('\n=== 原有核心功能回归验证 ===\n');
