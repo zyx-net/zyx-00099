@@ -921,25 +921,59 @@ export default function IssueDetail() {
                   )}
                   {history.planDetail && (
                     <div className="mt-2 text-xs text-gray-600 bg-teal-50 border border-teal-100 rounded p-3">
-                      <p className="font-medium text-teal-700 mb-1.5">复查计划变更</p>
+                      <p className="font-medium text-teal-700 mb-1.5">复查计划变更详情</p>
                       <div className="space-y-1">
-                        {history.planDetail.reviewTimeBefore !== undefined && (
-                          <p>复查时间：{history.planDetail.reviewTimeBefore || '-'} → {history.planDetail.reviewTimeAfter || '-'}</p>
-                        )}
-                        {history.planDetail.assigneeBefore !== undefined && (
-                          <p>责任人：{history.planDetail.assigneeBefore || '-'} → {history.planDetail.assigneeAfter || '-'}</p>
-                        )}
-                        {history.planDetail.noteBefore !== undefined && (
-                          <p>整改说明：{String(history.planDetail.noteBefore || '').slice(0, 40)} → {String(history.planDetail.noteAfter || '').slice(0, 40)}</p>
-                        )}
                         {history.planDetail.conflictResolution && (
-                          <p>冲突解决方式：{history.planDetail.conflictResolution === 'local' ? '采用本地' : history.planDetail.conflictResolution === 'remote' ? '采用远程' : '合并保留双方'}</p>
+                          <>
+                            <p>
+                              冲突解决方式：
+                              <span className={cn(
+                                'font-medium',
+                                history.planDetail.conflictResolution === 'local' && 'text-blue-600',
+                                history.planDetail.conflictResolution === 'remote' && 'text-orange-600',
+                                history.planDetail.conflictResolution === 'merge' && 'text-teal-700'
+                              )}>
+                                {history.planDetail.conflictResolution === 'local' ? '采用本地版本' :
+                                 history.planDetail.conflictResolution === 'remote' ? '采用远程版本' :
+                                 '合并保留双方'}
+                              </span>
+                            </p>
+                            {history.planDetail.localVersion && history.planDetail.remoteVersion && (() => {
+                              const diffs = diffReviewPlans(history.planDetail.localVersion, history.planDetail.remoteVersion);
+                              if (diffs.length === 0) return null;
+                              return (
+                                <div className="mt-2 bg-white/60 rounded p-2 space-y-0.5">
+                                  <p className="text-teal-600 font-medium mb-1">差异字段：</p>
+                                  {diffs.map((d, i) => (
+                                    <p key={i}>
+                                      <span className="text-gray-500">{d.label}：</span>
+                                      <span className="text-blue-600">本地 {String(d.local ?? '空')}</span>
+                                      <span className="text-gray-400 mx-1">vs</span>
+                                      <span className="text-orange-600">远程 {String(d.remote ?? '空')}</span>
+                                    </p>
+                                  ))}
+                                </div>
+                              );
+                            })()}
+                          </>
                         )}
-                        {history.planDetail.syncError && (
-                          <p className="text-red-600">同步失败：{history.planDetail.syncError}</p>
+                        {history.planDetail.field && !history.planDetail.conflictResolution && (
+                          <p>
+                            变更字段：<span className="font-medium text-teal-700">{history.planDetail.field}</span>
+                          </p>
                         )}
-                        {history.planDetail.version && (
-                          <p>版本：{history.planDetail.version}</p>
+                        {history.planDetail.oldValue !== undefined && history.planDetail.newValue !== undefined && (
+                          <p>
+                            变更内容：
+                            <span className="text-gray-500">{String(history.planDetail.oldValue).slice(0, 30) || '空'}</span>
+                            <span className="mx-1">→</span>
+                            <span className="text-teal-700 font-medium">{String(history.planDetail.newValue).slice(0, 30) || '空'}</span>
+                          </p>
+                        )}
+                        {history.planDetail.localVersion && !history.planDetail.conflictResolution && (
+                          <p>
+                            本地版本号：<span className="font-mono text-teal-700">v{history.planDetail.localVersion.version}</span>
+                          </p>
                         )}
                       </div>
                     </div>

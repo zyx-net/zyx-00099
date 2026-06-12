@@ -694,6 +694,10 @@ export const useAppStore = create<AppState>((set, get) => ({
               timestamp: new Date().toISOString(),
               planId: plan.id,
               remark: '复查计划同步成功',
+              planDetail: {
+                field: 'sync',
+                newValue: 'succeeded',
+              },
             };
             await db.addHistory(h);
           }
@@ -720,6 +724,12 @@ export const useAppStore = create<AppState>((set, get) => ({
               timestamp: new Date().toISOString(),
               planId: plan.id,
               remark: '复查计划同步失败：版本冲突',
+              planDetail: {
+                field: 'sync_fail',
+                newValue: '版本冲突',
+                localVersion: plan,
+                remoteVersion: planResult.remotePlan,
+              },
             };
             await db.addHistory(h);
           }
@@ -996,6 +1006,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       timestamp: now,
       planId: plan.id,
       remark: `创建复查计划，责任人：${data.assigneeName || data.assigneeId}，复查时间：${data.reviewTime}`,
+      planDetail: {
+        field: 'create',
+        newValue: `${data.assigneeName || data.assigneeId} / ${data.reviewTime}`,
+        localVersion: plan,
+      },
     };
     await db.addHistory(history);
 
@@ -1038,6 +1053,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     await db.updateReviewPlan(updated);
 
     const changeFields = Object.keys(updates).join(', ');
+    const oldValues: string[] = [];
+    const newValues: string[] = [];
+    for (const key of Object.keys(updates) as Array<keyof typeof updates>) {
+      const oldVal = plan[key];
+      const newVal = updates[key];
+      oldValues.push(String(oldVal ?? ''));
+      newValues.push(String(newVal ?? ''));
+    }
     const history: History = {
       id: generateId(),
       issueId: plan.issueId,
@@ -1049,6 +1072,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       remark: `更新复查计划字段：${changeFields}`,
       planDetail: {
         field: changeFields,
+        oldValue: oldValues.join(' | '),
+        newValue: newValues.join(' | '),
       },
     };
     await db.addHistory(history);
@@ -1091,6 +1116,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       timestamp: now,
       planId: plan.id,
       remark: '删除复查计划',
+      planDetail: {
+        field: 'delete',
+        oldValue: plan.assigneeName || plan.assigneeId,
+        localVersion: plan,
+      },
     };
     await db.addHistory(history);
 

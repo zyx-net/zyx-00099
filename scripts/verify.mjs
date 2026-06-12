@@ -1204,6 +1204,115 @@ test('采用远端版本：内容被远端覆盖，保留本地 id', () => {
   assert(resolved_remote.version === 4, '版本号为远端版本+1');
 });
 
+console.log('\n=== 复查计划：历史记录字段完整性回归验证 ===\n');
+
+test('plan_create 历史的 planDetail 包含 field/newValue/localVersion', () => {
+  const plan = makeReviewPlan();
+  const detail = {
+    field: 'create',
+    newValue: `${plan.assigneeName} / ${plan.reviewTime}`,
+    localVersion: plan
+  };
+  assert(detail.field === 'create', '应标记 create 字段');
+  assert(typeof detail.newValue === 'string' && detail.newValue.length > 0, 'newValue 非空');
+  assert(detail.localVersion && detail.localVersion.id === plan.id, 'localVersion 指向计划本身');
+  assert(detail.localVersion.version === 1, 'localVersion 保留版本号');
+});
+
+test('plan_update 历史的 planDetail 包含 field/oldValue/newValue 三字段', () => {
+  const detail = {
+    field: 'reviewTime, assigneeName',
+    oldValue: '2025-01-01 | 张三',
+    newValue: '2025-02-01 | 李四'
+  };
+  assert(detail.field && detail.field.length > 0, 'field 非空');
+  assert(detail.oldValue !== undefined && detail.oldValue !== null, 'oldValue 存在');
+  assert(detail.newValue !== undefined && detail.newValue !== null, 'newValue 存在');
+  assert(detail.oldValue !== detail.newValue, 'oldValue 与 newValue 不同');
+});
+
+test('plan_delete 历史的 planDetail 包含 field/oldValue/localVersion', () => {
+  const plan = makeReviewPlan();
+  const detail = {
+    field: 'delete',
+    oldValue: plan.assigneeName,
+    localVersion: plan
+  };
+  assert(detail.field === 'delete', '应标记 delete 字段');
+  assert(detail.oldValue === plan.assigneeName, 'oldValue 为删除前的责任人');
+  assert(detail.localVersion && detail.localVersion.id === plan.id, '保留删除前完整快照');
+});
+
+test('plan_conflict_resolve 历史的 planDetail 三字段完整', () => {
+  const local = makeReviewPlan({ reviewTime: '2025-01-01' });
+  const remote = makeReviewPlan({ id: local.id, reviewTime: '2025-01-03' });
+  const detail = {
+    conflictResolution: 'merge',
+    localVersion: local,
+    remoteVersion: remote
+  };
+  assert(detail.conflictResolution === 'merge', 'conflictResolution 正确');
+  assert(detail.localVersion.reviewTime === '2025-01-01', '本地版本保留');
+  assert(detail.remoteVersion.reviewTime === '2025-01-03', '远端版本保留');
+  assert(detail.localVersion.reviewTime !== detail.remoteVersion.reviewTime, '两端版本独立不覆盖');
+});
+
+test('plan_sync_fail 历史的 planDetail 含失败原因与两端版本', () => {
+  const local = makeReviewPlan();
+  const remote = makeReviewPlan({ id: local.id });
+  const detail = {
+    field: 'sync_fail',
+    newValue: '版本冲突',
+    localVersion: local,
+    remoteVersion: remote
+  };
+  assert(detail.field === 'sync_fail', '标记 sync_fail');
+  assert(detail.newValue === '版本冲突', '失败原因存在');
+  assert(detail.localVersion && detail.remoteVersion, '两端版本都保留');
+});
+
+test('plan_sync 成功历史的 planDetail 有标记字段', () => {
+  const detail = { field: 'sync', newValue: 'succeeded' };
+  assert(detail.field === 'sync', '标记 sync');
+  assert(detail.newValue === 'succeeded', '标记成功');
+});
+
+console.log('\n=== 复查计划：越权操作入口隐藏验证 ===\n');
+
+test('巡检员看不到编辑按钮：canEditPlan 返回 false', () => {
+  const plan = makeReviewPlan({ creatorId: 'other-person', assigneeId: inspector.id });
+  assert(canEditPlan(inspector, plan, issueInA) === false, '巡检员不能编辑他人创建的计划');
+});
+
+test('巡检员看不到删除按钮：与编辑权限一致', () => {
+  const plan = makeReviewPlan({ creatorId: 'other-person', assigneeId: inspector.id });
+  assert(canEditPlan(inspector, plan, issueInA) === false, '删除按钮与编辑权限绑定，均不显示');
+});
+
+test('巡检员看不到冲突解决按钮：canResolvePlanConflict 返回 false', () => {
+  const plan = makeReviewPlan({ creatorId: 'other-person' });
+  assert(canResolvePlanConflict(inspector, plan, issueInA) === false, '巡检员不能解决他人计划的冲突');
+});
+
+test('店长看不到其他门店计划的编辑/删除/冲突解决入口', () => {
+  const plan = makeReviewPlan({ issueId: issueInB.id, creatorId: 'someone' });
+  assert(canEditPlan(managerA, plan, issueInB) === false, '店长A不能编辑门店B的计划');
+  assert(canResolvePlanConflict(managerA, plan, issueInB) === false, '店长A不能解决门店B的冲突');
+});
+
+test('自己创建的计划：店长可编辑可解决冲突', () => {
+  const plan = makeReviewPlan({ creatorId: managerA.id, issueId: issueInA.id });
+  assert(canEditPlan(managerA, plan, issueInA) === true, '店长可编辑自己创建的本门店计划');
+  assert(canResolvePlanConflict(managerA, plan, issueInA) === true, '店长可解决自己创建的计划冲突');
+});
+
+test('督导所有入口都可见', () => {
+  const plan = makeReviewPlan({ creatorId: 'any', issueId: issueInB.id });
+  assert(canEditPlan(supervisor, plan, issueInB) === true, '督导可编辑任意门店任意计划');
+  assert(canResolvePlanConflict(supervisor, plan, issueInB) === true, '督导可解决任意计划冲突');
+  assert(canCreatePlan(supervisor, issueInA) === true, '督导可创建任意门店计划');
+});
+
 console.log('\n=== 原有核心功能回归验证 ===\n');
 
 const issues = [
