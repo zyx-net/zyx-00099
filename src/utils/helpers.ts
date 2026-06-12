@@ -92,6 +92,8 @@ export const ACTION_LABELS: Record<HistoryAction, string> = {
   plan_conflict_resolve: '解决复查计划冲突',
   plan_sync: '复查计划同步成功',
   plan_sync_fail: '复查计划同步失败',
+  plan_handover_export: '导出交接包',
+  plan_handover_import: '导入交接包',
 };
 
 export function getRoleName(role: UserRole): string {

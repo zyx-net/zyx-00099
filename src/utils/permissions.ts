@@ -19,6 +19,7 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan:edit_own',
     'plan:view_store',
     'plan_conflict:resolve_own',
+    'handover:export_own',
   ],
   supervisor: [
     'issue:view_all',
@@ -33,6 +34,8 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan:edit_all',
     'plan:view_all',
     'plan_conflict:resolve_all',
+    'handover:export_all',
+    'handover:import',
   ]
 };
 
@@ -106,4 +109,15 @@ export function canResolvePlanConflict(user: User | null | undefined, plan: Revi
   if (hasPermission(user.role, 'plan_conflict:resolve_own') && plan.creatorId === user.id) return true;
   if (user.role === 'manager' && issue && user.storeId === issue.storeId) return true;
   return false;
+}
+
+export function canExportHandover(user: User | null | undefined, issue: Issue | undefined): boolean {
+  if (!user || !issue) return false;
+  if (hasPermission(user.role, 'handover:export_all')) return true;
+  if (hasPermission(user.role, 'handover:export_own') && user.storeId === issue.storeId) return true;
+  return false;
+}
+
+export function canImportHandover(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'handover:import');
 }

@@ -2,14 +2,15 @@ import { useState, useEffect, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAppStore } from '@/store';
 import { IssueStatus, Issue, ReviewPlan, PlanConflict, PlanAttachment, UserRole } from '@/types';
-import { hasPermission, canManageIssue, canCreatePlan, canEditPlan, canResolvePlanConflict, canViewPlan } from '@/utils/permissions';
+import { hasPermission, canManageIssue, canCreatePlan, canEditPlan, canResolvePlanConflict, canViewPlan, canExportHandover } from '@/utils/permissions';
 import { IssueStatusBadge, PriorityBadge } from '@/components/StatusBadge';
 import { formatDate, ACTION_LABELS, getRoleName, PLAN_SYNC_STATUS_LABELS, PLAN_SYNC_STATUS_COLORS } from '@/utils/helpers';
 import {
   ArrowLeft, Store, Calendar, User, FileText, CloudOff, Cloud, AlertTriangle,
   CheckCircle, XCircle, Edit3, Image as ImageIcon, MessageSquare, AlertCircle,
   History as HistoryIcon, GitBranch, Shield, RefreshCw, ArrowRight, Plus,
-  ClipboardCheck, Trash2, Save, X, File, ChevronDown, ChevronUp
+  ClipboardCheck, Trash2, Save, X, File, ChevronDown, ChevronUp, Download,
+  Package
 } from 'lucide-react';
 import { diffReviewPlans } from '@/services/syncService';
 import { generateId } from '@/utils/helpers';
@@ -23,7 +24,7 @@ export default function IssueDetail() {
     reviewPlans, planConflicts,
     updateIssueStatus, resolveConflict, addToast, getTemplateForIssue,
     createReviewPlan, updateReviewPlan, deleteReviewPlan, resolvePlanConflict,
-    getReviewPlansForIssue,
+    getReviewPlansForIssue, exportHandover,
   } = useAppStore();
 
   const [showConflict, setShowConflict] = useState(false);
@@ -563,15 +564,27 @@ export default function IssueDetail() {
               </span>
             )}
           </h3>
-          {canAddPlan && (issue?.status === 'rejected' || issue?.status === 'submitted') && (
-            <button
-              onClick={openCreatePlan}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1e3a5f] text-white text-sm rounded-lg hover:bg-[#2d4a6f] transition-colors"
-            >
-              <Plus size={16} />
-              新建计划
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {canExportHandover(currentUser, issue) && visiblePlans.length > 0 && (
+              <button
+                onClick={() => exportHandover(id!)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-white text-[#1e3a5f] border border-[#1e3a5f]/30 text-sm rounded-lg hover:bg-blue-50 transition-colors"
+                title="导出交接包"
+              >
+                <Package size={16} />
+                导出交接包
+              </button>
+            )}
+            {canAddPlan && (issue?.status === 'rejected' || issue?.status === 'submitted') && (
+              <button
+                onClick={openCreatePlan}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#1e3a5f] text-white text-sm rounded-lg hover:bg-[#2d4a6f] transition-colors"
+              >
+                <Plus size={16} />
+                新建计划
+              </button>
+            )}
+          </div>
         </div>
 
         {issuePlanConflicts.length > 0 && issuePlanConflicts.map(pc => (

@@ -575,6 +575,16 @@ export function generateCSVWithVersions(
     '迁移来源版本',
     '迁移ID',
     '复查计划数量',
+    '复查计划ID',
+    '复查计划版本',
+    '复查时间',
+    '复查责任人',
+    '复查责任人角色',
+    '复查计划状态',
+    '复查计划是否同步',
+    '复查计划创建人',
+    '复查计划附件数',
+    '复查计划整改备注',
     '复查计划摘要',
     '复查计划冲突数',
     '附件占位信息',
@@ -592,6 +602,18 @@ export function generateCSVWithVersions(
     const attachmentPlaceholder = plans.some(p =>
       (p.attachments || []).some(a => a.placeholder)
     ) ? '含占位附件，需重新上传' : '';
+    
+    const planIds = plans.map(p => p.id).join('; ');
+    const planVersions = plans.map(p => `v${p.version}`).join('; ');
+    const planReviewTimes = plans.map(p => p.reviewTime).join('; ');
+    const planAssignees = plans.map(p => p.assigneeName || p.assigneeId).join('; ');
+    const planAssigneeRoles = plans.map(p => p.assigneeRole || '').join('; ');
+    const planStatuses = plans.map(p => p.status).join('; ');
+    const planSynced = plans.map(p => p.synced ? '是' : '否').join('; ');
+    const planCreators = plans.map(p => p.creatorId).join('; ');
+    const planAttachmentCounts = plans.map(p => (p.attachments || []).length).join('; ');
+    const planNotes = plans.map(p => (p.rectificationNote || '').replace(/"/g, "'").replace(/\n/g, ' ')).join(' | ');
+    
     return [
       issue.id,
       issue.title,
@@ -608,6 +630,16 @@ export function generateCSVWithVersions(
       issue.migrationSource?.fromTemplateVersion || '',
       issue.migrationSource?.migrationId || '',
       plans.length,
+      planIds,
+      planVersions,
+      planReviewTimes,
+      planAssignees,
+      planAssigneeRoles,
+      planStatuses,
+      planSynced,
+      planCreators,
+      planAttachmentCounts,
+      planNotes,
       planSummary,
       0,
       attachmentPlaceholder,

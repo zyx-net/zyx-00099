@@ -4,8 +4,8 @@ function generateId() {
 
 const ROLE_PERMISSIONS = {
   inspector: ['issue:create', 'issue:edit_own', 'issue:view_own', 'plan:view_own'],
-  manager: ['issue:view_all', 'issue:close', 'export:data', 'plan:create', 'plan:edit_own', 'plan:view_store', 'plan_conflict:resolve_own'],
-  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all']
+  manager: ['issue:view_all', 'issue:close', 'export:data', 'plan:create', 'plan:edit_own', 'plan:view_store', 'plan_conflict:resolve_own', 'handover:export_own'],
+  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all', 'handover:export_all', 'handover:import']
 };
 
 function hasPermission(role, permission) {
@@ -864,6 +864,107 @@ function makePlanConflict(local, remote, overrides = {}) {
 
 // ========== 扩展导入导出 ==========
 
+function generateCSVWithVersions(issues, stores, templates, migrations, reviewPlans = []) {
+  const storeMap = new Map(stores.map(s => [s.id, s.name]));
+  const templateMap = new Map(templates.map(t => [t.id, t]));
+  const migrationMap = new Map(migrations.map(m => [m.id, m]));
+  const plansByIssue = new Map();
+  for (const plan of reviewPlans) {
+    const list = plansByIssue.get(plan.issueId) || [];
+    list.push(plan);
+    plansByIssue.set(plan.issueId, list);
+  }
+
+  const headers = [
+    '问题编号',
+    '标题',
+    '门店',
+    '模板名称',
+    '模板版本',
+    '状态',
+    '优先级',
+    '创建时间',
+    '更新时间',
+    '是否同步',
+    '数据版本号',
+    '是否迁移过',
+    '迁移来源版本',
+    '迁移ID',
+    '复查计划数量',
+    '复查计划ID',
+    '复查计划版本',
+    '复查时间',
+    '复查责任人',
+    '复查责任人角色',
+    '复查计划状态',
+    '复查计划是否同步',
+    '复查计划创建人',
+    '复查计划附件数',
+    '复查计划整改备注',
+    '复查计划摘要',
+    '复查计划冲突数',
+    '附件占位信息',
+  ];
+
+  const rows = issues.map(issue => {
+    const tpl = templateMap.get(issue.templateId);
+    const migration = issue.migrationSource
+      ? migrationMap.get(issue.migrationSource.migrationId)
+      : undefined;
+    const plans = plansByIssue.get(issue.id) || [];
+    const planSummary = plans.map(p =>
+      `[${p.assigneeName || p.assigneeId}|${p.reviewTime}|${p.status}]`
+    ).join('; ');
+    const attachmentPlaceholder = plans.some(p =>
+      (p.attachments || []).some(a => a.placeholder)
+    ) ? '含占位附件，需重新上传' : '';
+
+    const planIds = plans.map(p => p.id).join('; ');
+    const planVersions = plans.map(p => `v${p.version}`).join('; ');
+    const planReviewTimes = plans.map(p => p.reviewTime).join('; ');
+    const planAssignees = plans.map(p => p.assigneeName || p.assigneeId).join('; ');
+    const planAssigneeRoles = plans.map(p => p.assigneeRole || '').join('; ');
+    const planStatuses = plans.map(p => p.status).join('; ');
+    const planSynced = plans.map(p => p.synced ? '是' : '否').join('; ');
+    const planCreators = plans.map(p => p.creatorId).join('; ');
+    const planAttachmentCounts = plans.map(p => (p.attachments || []).length).join('; ');
+    const planNotes = plans.map(p => (p.rectificationNote || '').replace(/"/g, "'").replace(/\n/g, ' ')).join(' | ');
+
+    return [
+      issue.id,
+      issue.title,
+      storeMap.get(issue.storeId) || issue.storeId,
+      tpl?.name || issue.templateId,
+      issue.templateVersion || '1.0',
+      issue.status,
+      issue.priority || 'medium',
+      issue.createdAt,
+      issue.updatedAt,
+      issue.synced ? '是' : '否',
+      issue.version,
+      issue.migrationSource ? '是' : '否',
+      issue.migrationSource?.fromTemplateVersion || '',
+      issue.migrationSource?.migrationId || '',
+      plans.length,
+      planIds,
+      planVersions,
+      planReviewTimes,
+      planAssignees,
+      planAssigneeRoles,
+      planStatuses,
+      planSynced,
+      planCreators,
+      planAttachmentCounts,
+      planNotes,
+      planSummary,
+      0,
+      attachmentPlaceholder,
+    ];
+  });
+
+  return [headers, ...rows].map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')).join('\n');
+}
+
 function buildExportPayloadV3(issues, stores, templates, migrations, unresolvedConflicts, reviewPlans, unresolvedPlanConflicts, currentUser) {
   const planList = (reviewPlans || []).map(p => ({
     ...p,
@@ -1337,6 +1438,679 @@ test('督导可看到所有问题', () => {
     return true;
   });
   assert(filtered.length === 4, '督导应能看到所有4条问题');
+});
+
+// ========== 交接包功能：辅助函数 ==========
+
+function canExportHandover(user, issue) {
+  if (!user || !issue) return false;
+  if (hasPermission(user.role, 'handover:export_all')) return true;
+  if (hasPermission(user.role, 'handover:export_own') && user.storeId === issue.storeId) return true;
+  return false;
+}
+
+function canImportHandover(user) {
+  return hasPermission(user?.role, 'handover:import');
+}
+
+function isHandoverPackage(raw) {
+  if (!raw) return false;
+  return raw && typeof raw === 'object' && raw.packageType === 'handover';
+}
+
+function buildHandoverPackage(issue, reviewPlans, planConflicts, histories, exportedBy, storeName) {
+  const issuePlans = reviewPlans.filter(p => p.issueId === issue.id);
+  const issueConflicts = planConflicts.filter(c => c.issueId === issue.id);
+  const keyHistories = histories.filter(h => h.issueId === issue.id).slice(-20);
+
+  const attachmentSummary = issuePlans.map(plan => ({
+    planId: plan.id,
+    planReviewTime: plan.reviewTime,
+    attachments: (plan.attachments || []).map(att => ({
+      ...att,
+      url: undefined,
+      placeholder: true,
+    })),
+    note: plan.rectificationNote,
+  }));
+
+  const statusCounts = {};
+  for (const plan of issuePlans) {
+    statusCounts[plan.status] = (statusCounts[plan.status] || 0) + 1;
+  }
+  const syncStatusSummary = Object.entries(statusCounts).map(([status, count]) => ({
+    status,
+    count,
+  }));
+
+  return {
+    packageType: 'handover',
+    schemaVersion: '1.0',
+    issueId: issue.id,
+    issueTitle: issue.title,
+    reviewPlans: issuePlans,
+    planConflicts: issueConflicts,
+    keyHistories,
+    attachmentSummary,
+    syncStatusSummary,
+    exportedAt: new Date().toISOString(),
+    exportedBy: {
+      id: exportedBy.id,
+      name: exportedBy.name,
+      role: exportedBy.role,
+    },
+    storeName,
+  };
+}
+
+function validateHandoverImport(raw, existingPlans, currentUser, issue) {
+  const warnings = [];
+  const errors = [];
+  const planItems = [];
+
+  if (!isHandoverPackage(raw)) {
+    return {
+      valid: false,
+      issueId: '',
+      plans: [],
+      warnings: [],
+      errors: ['文件不是有效的交接包格式'],
+      summary: { totalPlans: 0, canImportCount: 0, conflictCount: 0, newPlansCount: 0 },
+    };
+  }
+
+  const pkg = raw;
+
+  if (!pkg.reviewPlans || !Array.isArray(pkg.reviewPlans)) {
+    errors.push('交接包缺少复查计划数据');
+    return {
+      valid: false,
+      issueId: pkg.issueId || '',
+      plans: [],
+      warnings,
+      errors,
+      summary: { totalPlans: 0, canImportCount: 0, conflictCount: 0, newPlansCount: 0 },
+    };
+  }
+
+  if (!currentUser) {
+    errors.push('请先选择身份后再导入交接包');
+    return {
+      valid: false,
+      issueId: pkg.issueId || '',
+      plans: [],
+      warnings,
+      errors,
+      summary: { totalPlans: 0, canImportCount: 0, conflictCount: 0, newPlansCount: 0 },
+    };
+  }
+
+  const existingPlanMap = new Map(existingPlans.map(p => [p.id, p]));
+  let canImportCount = 0;
+  let conflictCount = 0;
+  let newPlansCount = 0;
+
+  for (const plan of pkg.reviewPlans) {
+    const conflictTypes = [];
+    const localPlan = existingPlanMap.get(plan.id);
+    let canImport = true;
+    let reason = '';
+
+    if (!issue) {
+      conflictTypes.push('issue_not_found');
+      canImport = false;
+      reason = '本地找不到对应问题';
+      warnings.push(`计划 ${plan.id.slice(0, 8)}...：本地找不到对应问题，无法导入`);
+    }
+
+    if (issue && !canCreatePlan(currentUser, issue)) {
+      conflictTypes.push('no_permission');
+      canImport = false;
+      reason = '无权为此问题创建或修改复查计划';
+      warnings.push(`计划 ${plan.id.slice(0, 8)}...：无权操作此问题的复查计划`);
+    }
+
+    if (localPlan) {
+      conflictTypes.push('local_exists');
+      conflictCount++;
+
+      if (localPlan.version > plan.version) {
+        conflictTypes.push('version_behind');
+        warnings.push(`计划 ${plan.id.slice(0, 8)}...：导入版本 (v${plan.version}) 落后于本地版本 (v${localPlan.version})`);
+      }
+
+      if (localPlan.assigneeId !== plan.assigneeId) {
+        conflictTypes.push('assignee_mismatch');
+        warnings.push(`计划 ${plan.id.slice(0, 8)}...：责任人不一致（本地: ${localPlan.assigneeName || localPlan.assigneeId}，导入: ${plan.assigneeName || plan.assigneeId}）`);
+      }
+
+      if (issue && !canEditPlan(currentUser, localPlan, issue)) {
+        conflictTypes.push('no_permission');
+        canImport = false;
+        reason = '无权修改本地已存在的复查计划';
+        warnings.push(`计划 ${plan.id.slice(0, 8)}...：无权修改本地已存在的复查计划`);
+      }
+    } else {
+      newPlansCount++;
+    }
+
+    if (canImport) {
+      canImportCount++;
+    }
+
+    planItems.push({
+      plan,
+      conflictTypes,
+      localPlan,
+      canImport,
+      reason,
+    });
+  }
+
+  if (pkg.exportedBy) {
+    warnings.push(`交接包由 ${pkg.exportedBy.name} (${pkg.exportedBy.role === 'supervisor' ? '督导' : pkg.exportedBy.role === 'manager' ? '店长' : '巡检员'}) 于 ${new Date(pkg.exportedAt).toLocaleString('zh-CN')} 导出`);
+  }
+
+  return {
+    valid: errors.length === 0 && planItems.some(p => p.canImport),
+    issueId: pkg.issueId,
+    issueTitle: pkg.issueTitle,
+    plans: planItems,
+    warnings,
+    errors,
+    summary: {
+      totalPlans: planItems.length,
+      canImportCount,
+      conflictCount,
+      newPlansCount,
+    },
+  };
+}
+
+function mergeHandoverPlan(localPlan, importPlan) {
+  const mergedAttachments = [
+    ...(localPlan.attachments || []),
+    ...(importPlan.attachments || []).filter(
+      ia => !(localPlan.attachments || []).some(la => la.id === ia.id),
+    ),
+  ];
+
+  const mergedNote = [
+    localPlan.rectificationNote,
+    `--- 交接包导入备注 ---\n${importPlan.rectificationNote}`,
+  ].filter(Boolean).join('\n\n');
+
+  return {
+    ...localPlan,
+    version: Math.max(localPlan.version, importPlan.version) + 1,
+    rectificationNote: mergedNote,
+    attachments: mergedAttachments,
+    reviewTime: importPlan.reviewTime || localPlan.reviewTime,
+    assigneeId: importPlan.assigneeId || localPlan.assigneeId,
+    assigneeName: importPlan.assigneeName || localPlan.assigneeName,
+    assigneeRole: importPlan.assigneeRole || localPlan.assigneeRole,
+    synced: false,
+    status: 'draft',
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function applyHandoverResolution(item, resolution) {
+  const { plan, localPlan } = item;
+
+  if (resolution === 'keep_local' && localPlan) {
+    return { ...localPlan, synced: false, updatedAt: new Date().toISOString() };
+  }
+
+  if (resolution === 'adopt_import') {
+    if (localPlan) {
+      return {
+        ...plan,
+        id: localPlan.id,
+        version: Math.max(localPlan.version, plan.version) + 1,
+        synced: false,
+        status: 'draft',
+        updatedAt: new Date().toISOString(),
+      };
+    }
+    return {
+      ...plan,
+      version: plan.version + 1,
+      synced: false,
+      status: 'draft',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  if (resolution === 'merge' && localPlan) {
+    return mergeHandoverPlan(localPlan, plan);
+  }
+
+  return null;
+}
+
+// ========== 交接包功能：测试用例 ==========
+
+console.log('\n=== 交接包功能：权限体系验证 ===\n');
+
+test('店长可导出自己门店问题的交接包', () => {
+  assert(canExportHandover(managerA, issueInA) === true, '店长A应能导出门店A问题的交接包');
+});
+
+test('店长不可导出其他门店问题的交接包', () => {
+  assert(canExportHandover(managerA, issueInB) === false, '店长A不应能导出门店B问题的交接包');
+});
+
+test('督导可导出任意门店问题的交接包', () => {
+  assert(canExportHandover(supervisor, issueInA) === true, '督导应能导出门店A问题的交接包');
+  assert(canExportHandover(supervisor, issueInB) === true, '督导应能导出门店B问题的交接包');
+});
+
+test('巡检员不能导出任何交接包', () => {
+  assert(canExportHandover(inspector, issueInA) === false, '巡检员不能导出交接包');
+  assert(canExportHandover(inspector, issueInB) === false, '巡检员不能导出交接包');
+});
+
+test('只有督导可导入交接包', () => {
+  assert(canImportHandover(supervisor) === true, '督导应有导入权限');
+  assert(canImportHandover(managerA) === false, '店长不应有导入权限');
+  assert(canImportHandover(inspector) === false, '巡检员不应有导入权限');
+});
+
+console.log('\n=== 交接包功能：交接包构建验证 ===\n');
+
+test('buildHandoverPackage 包含所有必要字段', () => {
+  const plan1 = makeReviewPlan({ issueId: issueInA.id, rectificationNote: '整改说明1' });
+  const plan2 = makeReviewPlan({ issueId: issueInA.id, rectificationNote: '整改说明2' });
+  const conflict = makePlanConflict(plan1, plan2, { issueId: issueInA.id });
+  const histories = [
+    { id: 'h1', issueId: issueInA.id, action: 'plan_create', actorId: supervisor.id, timestamp: new Date().toISOString() },
+    { id: 'h2', issueId: issueInA.id, action: 'plan_update', actorId: supervisor.id, timestamp: new Date().toISOString() },
+  ];
+
+  const pkg = buildHandoverPackage(issueInA, [plan1, plan2, makeReviewPlan({ issueId: issueInB.id })], [conflict], histories, supervisor, '门店A');
+
+  assert(pkg.packageType === 'handover', 'packageType 应为 handover');
+  assert(pkg.issueId === issueInA.id, 'issueId 正确');
+  assert(pkg.reviewPlans.length === 2, '应只包含该问题的2条计划');
+  assert(pkg.planConflicts.length === 1, '应包含该问题的1条冲突');
+  assert(pkg.keyHistories.length === 2, '应包含该问题的历史记录');
+  assert(pkg.attachmentSummary.length === 2, '应包含附件摘要');
+  assert(pkg.syncStatusSummary.length > 0, '应包含同步状态摘要');
+  assert(pkg.exportedBy.id === supervisor.id, '导出人信息正确');
+  assert(pkg.storeName === '门店A', '门店名称正确');
+});
+
+test('交接包附件转为占位符，移除真实 URL', () => {
+  const plan = makeReviewPlan({
+    issueId: issueInA.id,
+    attachments: [{ id: 'att-1', name: '照片1.png', url: 'https://example.com/1.png' }],
+  });
+  const pkg = buildHandoverPackage(issueInA, [plan], [], [], supervisor, '门店A');
+  const summary = pkg.attachmentSummary.find(s => s.planId === plan.id);
+  assert(summary.attachments[0].placeholder === true, '附件应为占位符');
+  assert(summary.attachments[0].url === undefined, '附件真实 URL 应被移除');
+  assert(summary.attachments[0].name === '照片1.png', '附件名称应保留');
+});
+
+test('isHandoverPackage 正确识别交接包格式', () => {
+  const validPkg = { packageType: 'handover', schemaVersion: '1.0', issueId: 'test' };
+  const invalidPkg = { packageType: 'backup', issueId: 'test' };
+  assert(isHandoverPackage(validPkg) === true, '有效交接包应返回 true');
+  assert(isHandoverPackage(invalidPkg) === false, '无效交接包应返回 false');
+  assert(isHandoverPackage(null) === false, 'null 应返回 false');
+});
+
+console.log('\n=== 交接包功能：导入冲突检测验证 ===\n');
+
+test('检测本地已存在计划冲突', () => {
+  const existingPlan = makeReviewPlan({ id: 'plan-existing', issueId: issueInA.id, version: 1 });
+  const pkg = buildHandoverPackage(issueInA, [existingPlan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [existingPlan], supervisor, issueInA);
+  assert(result.plans[0].conflictTypes.includes('local_exists'), '应检测到本地已存在');
+});
+
+test('检测导入版本落后冲突', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', issueId: issueInA.id, version: 3 });
+  const importPlan = { ...localPlan, version: 1 };
+  const pkg = buildHandoverPackage(issueInA, [importPlan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [localPlan], supervisor, issueInA);
+  assert(result.plans[0].conflictTypes.includes('version_behind'), '应检测到版本落后');
+});
+
+test('检测责任人不匹配冲突', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', issueId: issueInA.id, assigneeId: 'ins-1', assigneeName: '巡检员1' });
+  const importPlan = { ...localPlan, assigneeId: 'ins-2', assigneeName: '巡检员2' };
+  const pkg = buildHandoverPackage(issueInA, [importPlan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [localPlan], supervisor, issueInA);
+  assert(result.plans[0].conflictTypes.includes('assignee_mismatch'), '应检测到责任人不匹配');
+});
+
+test('检测无权限操作冲突', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', issueId: issueInA.id, creatorId: 'other' });
+  const pkg = buildHandoverPackage(issueInA, [localPlan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [localPlan], inspector, issueInA);
+  assert(result.plans[0].conflictTypes.includes('no_permission'), '应检测到无权限');
+  assert(result.plans[0].canImport === false, '无权限时 canImport 应为 false');
+});
+
+test('检测问题不存在冲突', () => {
+  const plan = makeReviewPlan({ id: 'plan-1', issueId: issueInA.id });
+  const pkg = buildHandoverPackage(issueInA, [plan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [], supervisor, undefined);
+  assert(result.plans[0].conflictTypes.includes('issue_not_found'), '应检测到问题不存在');
+  assert(result.plans[0].canImport === false, '问题不存在时 canImport 应为 false');
+});
+
+test('非交接包格式导入返回错误', () => {
+  const result = validateHandoverImport({ some: 'data' }, [], supervisor, issueInA);
+  assert(result.valid === false, '非交接包应返回 invalid');
+  assert(result.errors.includes('文件不是有效的交接包格式'), '应有格式错误提示');
+});
+
+test('未登录用户导入被拒绝', () => {
+  const plan = makeReviewPlan({ issueId: issueInA.id });
+  const pkg = buildHandoverPackage(issueInA, [plan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [], null, issueInA);
+  assert(result.valid === false, '未登录用户应返回 invalid');
+  assert(result.errors.includes('请先选择身份后再导入交接包'), '应有登录提示');
+});
+
+test('普通检查员无权限导入交接包', () => {
+  const plan = makeReviewPlan({ issueId: issueInA.id });
+  const pkg = buildHandoverPackage(issueInA, [plan], [], [], supervisor, '门店A');
+  const result = validateHandoverImport(pkg, [], inspector, issueInA);
+  assert(result.valid === false, '巡检员导入应返回 invalid');
+  assert(result.plans[0].conflictTypes.includes('no_permission'), '应检测到无权限');
+});
+
+console.log('\n=== 交接包功能：冲突解决策略验证 ===\n');
+
+test('保留本地策略：内容不变，更新同步状态', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', reviewTime: '2025-01-01', assigneeName: '本地责任人', version: 2, rectificationNote: '本地备注' });
+  const importPlan = makeReviewPlan({ id: 'plan-1', reviewTime: '2025-01-05', assigneeName: '导入责任人', version: 1, rectificationNote: '导入备注' });
+  const item = { plan: importPlan, localPlan, conflictTypes: ['local_exists'], canImport: true };
+  
+  const result = applyHandoverResolution(item, 'keep_local');
+  assert(result.reviewTime === '2025-01-01', '保留本地复查时间');
+  assert(result.assigneeName === '本地责任人', '保留本地责任人');
+  assert(result.rectificationNote === '本地备注', '保留本地备注');
+  assert(result.synced === false, '标记为未同步');
+});
+
+test('采用导入策略：覆盖本地内容，版本递增', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', reviewTime: '2025-01-01', assigneeName: '本地责任人', version: 2, rectificationNote: '本地备注' });
+  const importPlan = makeReviewPlan({ id: 'plan-1', reviewTime: '2025-01-05', assigneeName: '导入责任人', version: 3, rectificationNote: '导入备注' });
+  const item = { plan: importPlan, localPlan, conflictTypes: ['local_exists'], canImport: true };
+  
+  const result = applyHandoverResolution(item, 'adopt_import');
+  assert(result.reviewTime === '2025-01-05', '采用导入复查时间');
+  assert(result.assigneeName === '导入责任人', '采用导入责任人');
+  assert(result.rectificationNote === '导入备注', '采用导入备注');
+  assert(result.version === 4, '版本号应为 max(2,3)+1 = 4');
+  assert(result.id === 'plan-1', '保留本地 ID');
+});
+
+test('合并策略：附件合并去重，备注拼接，版本递增', () => {
+  const localPlan = makeReviewPlan({
+    id: 'plan-1', version: 2, rectificationNote: '本地备注',
+    attachments: [{ id: 'att-1', name: 'a.png' }],
+  });
+  const importPlan = makeReviewPlan({
+    id: 'plan-1', version: 3, rectificationNote: '导入备注',
+    attachments: [{ id: 'att-1', name: 'a.png' }, { id: 'att-2', name: 'b.png' }],
+  });
+  const item = { plan: importPlan, localPlan, conflictTypes: ['local_exists'], canImport: true };
+  
+  const result = applyHandoverResolution(item, 'merge');
+  assert(result.attachments.length === 2, '附件应合并去重为 2 个');
+  assert(result.rectificationNote.includes('本地备注'), '合并备注包含本地内容');
+  assert(result.rectificationNote.includes('导入备注'), '合并备注包含导入内容');
+  assert(result.rectificationNote.includes('交接包导入备注'), '包含交接包标记');
+  assert(result.version === 4, '版本号应为 max(2,3)+1 = 4');
+});
+
+test('mergeHandoverPlan 正确合并附件和备注', () => {
+  const local = makeReviewPlan({
+    version: 2, rectificationNote: '本地说明',
+    attachments: [{ id: 'att-1', name: 'a.png' }],
+  });
+  const imported = makeReviewPlan({
+    version: 3, rectificationNote: '导入说明',
+    attachments: [{ id: 'att-2', name: 'b.png' }],
+    reviewTime: '2025-02-01',
+    assigneeId: 'new-ins',
+    assigneeName: '新巡检员',
+  });
+  
+  const merged = mergeHandoverPlan(local, imported);
+  assert(merged.attachments.length === 2, '附件合并');
+  assert(merged.rectificationNote.includes('本地说明'), '保留本地备注');
+  assert(merged.rectificationNote.includes('导入说明'), '包含导入备注');
+  assert(merged.reviewTime === '2025-02-01', '采用导入复查时间');
+  assert(merged.assigneeId === 'new-ins', '采用导入责任人');
+  assert(merged.version === 4, '版本递增');
+});
+
+test('新建计划（无本地版本）采用导入策略正确', () => {
+  const importPlan = makeReviewPlan({ id: 'plan-new', issueId: issueInA.id, version: 1 });
+  const item = { plan: importPlan, conflictTypes: [], canImport: true };
+  
+  const result = applyHandoverResolution(item, 'adopt_import');
+  assert(result.id === 'plan-new', '保留计划 ID');
+  assert(result.issueId === issueInA.id, '保留问题关联');
+  assert(result.version === 2, '新版本号为导入版本+1');
+  assert(result.status === 'draft', '状态为草稿');
+  assert(result.synced === false, '未同步');
+});
+
+console.log('\n=== 交接包功能：历史记录与持久化验证 ===\n');
+
+test('交接包导出操作生成历史记录', () => {
+  const history = {
+    id: generateId(),
+    issueId: issueInA.id,
+    action: 'plan_handover_export',
+    actorId: supervisor.id,
+    actorRole: supervisor.role,
+    actorName: supervisor.name,
+    timestamp: new Date().toISOString(),
+    details: { packageSize: 1024, planCount: 2 },
+  };
+  assert(history.action === 'plan_handover_export', '动作类型正确');
+  assert(history.actorId === supervisor.id, '操作人正确');
+  assert(history.details.packageSize === 1024, '包含导出详情');
+});
+
+test('交接包导入操作生成历史记录并写入同步队列', () => {
+  const history = {
+    id: generateId(),
+    issueId: issueInA.id,
+    action: 'plan_handover_import',
+    actorId: supervisor.id,
+    actorRole: supervisor.role,
+    actorName: supervisor.name,
+    timestamp: new Date().toISOString(),
+    details: {
+      resolution: 'adopt_import',
+      importedPlans: 2,
+      skippedPlans: 1,
+      conflictCount: 1,
+    },
+  };
+  const syncQueueItem = {
+    id: generateId(),
+    planId: 'plan-1',
+    type: 'plan_handover_import',
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  assert(history.action === 'plan_handover_import', '导入动作类型正确');
+  assert(history.details.importedPlans === 2, '包含导入数量');
+  assert(syncQueueItem.type === 'plan_handover_import', '同步队列类型正确');
+  assert(syncQueueItem.status === 'pending', '同步队列状态正确');
+});
+
+test('交接包处理结果跨重启持久化', () => {
+  const importResult = {
+    success: true,
+    imported: 2,
+    skipped: 1,
+    histories: [
+      { id: 'h1', issueId: issueInA.id, action: 'plan_handover_import', timestamp: new Date().toISOString() },
+    ],
+    syncQueue: [
+      { id: 'sync-1', planId: 'plan-1', type: 'plan_handover_import', status: 'pending' },
+    ],
+  };
+  const serialized = JSON.stringify(importResult);
+  const recovered = JSON.parse(serialized);
+  assert(recovered.imported === 2, '导入数量持久化');
+  assert(recovered.histories.length === 1, '历史记录持久化');
+  assert(recovered.syncQueue.length === 1, '同步队列持久化');
+  assert(recovered.histories[0].action === 'plan_handover_import', '历史动作持久化');
+});
+
+console.log('\n=== 交接包功能：导入导出往返验证 ===\n');
+
+test('导出后再导入数据完整（往返一致性）', () => {
+  const plan1 = makeReviewPlan({
+    id: 'plan-abc', issueId: issueInA.id,
+    assigneeName: '责任人A', rectificationNote: '整改说明',
+    attachments: [{ id: 'att-1', name: '照片1.png', url: 'https://x.com/a.png' }],
+  });
+  const plan2 = makeReviewPlan({ id: 'plan-xyz', issueId: issueInA.id });
+  const conflict = makePlanConflict(plan1, plan1, { issueId: issueInA.id });
+  const histories = [
+    { id: 'h1', issueId: issueInA.id, action: 'plan_create', timestamp: new Date().toISOString() },
+  ];
+
+  const pkg = buildHandoverPackage(issueInA, [plan1, plan2], [conflict], histories, supervisor, '门店A');
+  const jsonStr = JSON.stringify(pkg);
+  const parsed = JSON.parse(jsonStr);
+
+  assert(isHandoverPackage(parsed) === true, '导入后仍识别为交接包');
+  assert(parsed.reviewPlans.length === 2, '计划数量一致');
+  assert(parsed.planConflicts.length === 1, '冲突数量一致');
+  assert(parsed.keyHistories.length === 1, '历史数量一致');
+  assert(parsed.attachmentSummary.length === 2, '附件摘要一致');
+  assert(parsed.exportedBy.name === supervisor.name, '导出人信息一致');
+});
+
+test('导入预览正确识别冲突并给出可读提示', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-1', issueId: issueInA.id, version: 3, assigneeId: 'ins-1' });
+  const importPlan = { ...localPlan, version: 2, assigneeId: 'ins-2' };
+  const pkg = buildHandoverPackage(issueInA, [importPlan], [], [], managerA, '门店A');
+  const result = validateHandoverImport(pkg, [localPlan], supervisor, issueInA);
+
+  assert(result.warnings.length > 0, '应有提示信息');
+  assert(result.warnings.some(w => w.includes('导入版本')), '提示版本落后');
+  assert(result.warnings.some(w => w.includes('责任人不一致')), '提示责任人不匹配');
+  assert(result.warnings.some(w => w.includes('交接包由')), '提示导出人信息');
+  assert(result.summary.totalPlans === 1, '总计划数正确');
+  assert(result.summary.conflictCount === 1, '冲突数正确');
+});
+
+console.log('\n=== 交接包功能：权限拦截与入口隐藏验证 ===\n');
+
+test('普通检查员看不到交接包导出入口', () => {
+  const canSeeExportButton = canExportHandover(inspector, issueInA);
+  assert(canSeeExportButton === false, '巡检员不应看到导出按钮');
+});
+
+test('普通检查员看不到交接包导入入口', () => {
+  const canSeeImportTab = canImportHandover(inspector);
+  assert(canSeeImportTab === false, '巡检员不应看到导入标签页');
+});
+
+test('店长只能看到自己门店的导出入口', () => {
+  assert(canExportHandover(managerA, issueInA) === true, '店长A看到门店A的导出按钮');
+  assert(canExportHandover(managerA, issueInB) === false, '店长A看不到门店B的导出按钮');
+});
+
+test('店长看不到交接包导入入口', () => {
+  assert(canImportHandover(managerA) === false, '店长不应看到导入标签页');
+});
+
+console.log('\n=== 交接包功能：CSV/JSON 导出字段一致性验证 ===\n');
+
+test('JSON 导出包含完整复查计划字段', () => {
+  const plan = makeReviewPlan({
+    id: 'plan-full', issueId: issueInA.id, version: 2, status: 'pending',
+    assigneeId: 'ins-1', assigneeName: '巡检员1', assigneeRole: 'inspector',
+    rectificationNote: '完整的整改说明',
+    attachments: [{ id: 'att-1', name: 'pic.png' }],
+    creatorId: supervisor.id, creatorRole: 'supervisor',
+    synced: false, lastSyncError: '测试错误',
+  });
+  const payload = buildExportPayloadV3([], [], [], [], [], [plan], [], supervisor);
+  const exportedPlan = payload.data.reviewPlans[0];
+  
+  assert(exportedPlan.id === 'plan-full', '包含计划ID');
+  assert(exportedPlan.version === 2, '包含版本号');
+  assert(exportedPlan.status === 'pending', '包含状态');
+  assert(exportedPlan.assigneeName === '巡检员1', '包含责任人');
+  assert(exportedPlan.rectificationNote === '完整的整改说明', '包含整改说明');
+  assert(exportedPlan.creatorId === supervisor.id, '包含创建人');
+  assert(exportedPlan.synced === false, '包含同步状态');
+  assert(exportedPlan.lastSyncError === '测试错误', '包含同步错误');
+  assert(exportedPlan.attachments.length === 1, '包含附件列表');
+});
+
+test('CSV 导出包含与 JSON 对应的复查计划字段', () => {
+  const plan1 = makeReviewPlan({
+    id: 'plan-csv-1', issueId: issueInA.id, version: 2,
+    assigneeId: 'ins-1', assigneeName: '巡检员1',
+    rectificationNote: 'CSV测试备注',
+    attachments: [{ id: 'att-1', name: 'a.png' }],
+    creatorId: supervisor.id, status: 'pending', synced: false,
+  });
+  const plan2 = makeReviewPlan({
+    id: 'plan-csv-2', issueId: issueInA.id, version: 1,
+    assigneeId: 'ins-2', assigneeName: '巡检员2',
+    status: 'completed', synced: true,
+  });
+  const csv = generateCSVWithVersions([issueInA], [storeA], [templateV1], [], [plan1, plan2]);
+  const lines = csv.split('\n');
+  const headers = lines[0].split(',').map(h => h.replace(/"/g, ''));
+  
+  assert(headers.includes('复查计划数量'), '包含计划数量');
+  assert(headers.includes('复查计划ID'), '包含计划ID');
+  assert(headers.includes('复查计划版本'), '包含计划版本');
+  assert(headers.includes('复查时间'), '包含复查时间');
+  assert(headers.includes('复查责任人'), '包含责任人');
+  assert(headers.includes('复查计划状态'), '包含状态');
+  assert(headers.includes('复查计划是否同步'), '包含同步状态');
+  assert(headers.includes('复查计划附件数'), '包含附件数');
+  assert(headers.includes('复查计划整改备注'), '包含整改备注');
+  
+  const dataRow = lines[1].split(',').map(h => h.replace(/"/g, ''));
+  const headerIndex = headers.indexOf('复查计划ID');
+  assert(dataRow[headerIndex].includes('plan-csv-1') && dataRow[headerIndex].includes('plan-csv-2'), 'CSV包含多个计划ID');
+});
+
+test('CSV 和 JSON 导出的复查计划字段一一对应', () => {
+  const plan = makeReviewPlan({
+    id: 'plan-consistent', issueId: issueInA.id, version: 3,
+    assigneeName: '测试责任人', status: 'completed', synced: true,
+  });
+  
+  const jsonPayload = buildExportPayloadV3([issueInA], [storeA], [templateV1], [], [], [plan], [], supervisor);
+  const jsonPlan = jsonPayload.data.reviewPlans[0];
+  
+  const csv = generateCSVWithVersions([issueInA], [storeA], [templateV1], [], [plan]);
+  const lines = csv.split('\n');
+  const headers = lines[0].split(',').map(h => h.replace(/"/g, ''));
+  const dataRow = lines[1].split(',').map(h => h.replace(/"/g, ''));
+  
+  const versionIdx = headers.indexOf('复查计划版本');
+  const statusIdx = headers.indexOf('复查计划状态');
+  const syncedIdx = headers.indexOf('复查计划是否同步');
+  
+  assert(dataRow[versionIdx] === `v${jsonPlan.version}`, '版本号一致');
+  assert(dataRow[statusIdx] === jsonPlan.status, '状态一致');
+  assert(dataRow[syncedIdx] === (jsonPlan.synced ? '是' : '否'), '同步状态一致');
 });
 
 console.log('\n=== 结果统计 ===');

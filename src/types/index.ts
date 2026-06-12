@@ -60,7 +60,9 @@ export type PlanHistoryAction =
   | 'plan_delete'
   | 'plan_conflict_resolve'
   | 'plan_sync'
-  | 'plan_sync_fail';
+  | 'plan_sync_fail'
+  | 'plan_handover_export'
+  | 'plan_handover_import';
 
 export interface PlanHistoryDetail {
   field?: string;
@@ -294,4 +296,66 @@ export interface ExportPayload {
     name: string;
   };
   schemaVersion: string;
+}
+
+export type HandoverConflictType =
+  | 'local_exists'
+  | 'version_behind'
+  | 'assignee_mismatch'
+  | 'no_permission'
+  | 'issue_not_found';
+
+export interface HandoverPlanItem {
+  plan: ReviewPlan;
+  conflictTypes: HandoverConflictType[];
+  localPlan?: ReviewPlan;
+  canImport: boolean;
+  reason?: string;
+  resolution?: 'keep_local' | 'adopt_import' | 'merge';
+  mergedPlan?: ReviewPlan;
+}
+
+export interface HandoverValidationResult {
+  valid: boolean;
+  issueId: string;
+  issueTitle?: string;
+  plans: HandoverPlanItem[];
+  warnings: string[];
+  errors: string[];
+  summary: {
+    totalPlans: number;
+    canImportCount: number;
+    conflictCount: number;
+    newPlansCount: number;
+  };
+}
+
+export interface HandoverPackage {
+  packageType: 'handover';
+  schemaVersion: string;
+  issueId: string;
+  issueTitle?: string;
+  storeId?: string;
+  storeName?: string;
+  reviewPlans: ReviewPlan[];
+  planConflicts: PlanConflict[];
+  keyHistories: History[];
+  attachmentSummary: Array<{
+    planId: string;
+    planReviewTime: string;
+    attachments: PlanAttachment[];
+    note?: string;
+  }>;
+  syncStatusSummary: Array<{
+    planId: string;
+    status: PlanSyncStatus;
+    lastSyncError?: string;
+    lastSyncAttempt?: string;
+  }>;
+  exportedAt: string;
+  exportedBy: {
+    id: string;
+    role: UserRole;
+    name: string;
+  };
 }

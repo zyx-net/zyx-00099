@@ -4,7 +4,7 @@ import {
   IssueStatus, UserRole, ToastMessage, HistoryAction, MigrationOption,
   FieldMapping, MigrationRecord, ImportValidationResult, TemplateDiff,
   ReviewPlan, PlanConflict, PlanAttachment, PlanSyncStatus, PlanHistoryDetail,
-  SyncEntityType,
+  SyncEntityType, HandoverValidationResult, HandoverPackage,
 } from '@/types';
 import * as db from '@/lib/db';
 import { generateId } from '@/utils/helpers';
@@ -13,10 +13,13 @@ import {
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields,
   syncPlanToServer, createPlanConflict, createPlanSyncQueueItem,
   diffReviewPlans, mergeReviewPlans,
+  buildHandoverPackage, downloadHandoverPackage, validateHandoverImport,
+  applyHandoverResolution, isHandoverPackage,
 } from '@/services/syncService';
 import {
   canManageIssue, canUpgradeTemplate, hasPermission,
   canCreatePlan, canEditPlan, canViewPlan, canResolvePlanConflict,
+  canExportHandover, canImportHandover,
 } from '@/utils/permissions';
 import {
   diffTemplateVersions,
@@ -50,6 +53,7 @@ interface AppState {
   isLoading: boolean;
   pendingUpgrades: PendingTemplateUpgrade[];
   lastImportValidation: ImportValidationResult | null;
+  lastHandoverValidation: HandoverValidationResult | null;
 
   init: () => Promise<void>;
   setCurrentUser: (user: User | null) => void;
@@ -94,6 +98,11 @@ interface AppState {
   getReviewPlansForIssue: (issueId: string) => ReviewPlan[];
   getReviewPlansForCurrentUser: () => ReviewPlan[];
 
+  exportHandover: (issueId: string) => void;
+  previewHandoverImport: (rawData: any) => HandoverValidationResult | null;
+  confirmHandoverImport: (resolutions: Record<string, 'keep_local' | 'adopt_import' | 'merge'>) => Promise<{ success: boolean; imported: number; skipped: number }>;
+  clearHandoverValidation: () => void;
+
   addToast: (type: ToastMessage['type'], message: string) => void;
   removeToast: (id: string) => void;
 
@@ -118,6 +127,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   isLoading: false,
   pendingUpgrades: [],
   lastImportValidation: null,
+  lastHandoverValidation: null,
 
   init: async () => {
     set({ isLoading: true });
@@ -1239,6 +1249,178 @@ export const useAppStore = create<AppState>((set, get) => ({
       const issue = issues.find(i => i.id === p.issueId);
       return canViewPlan(currentUser, p, issue);
     });
+  },
+
+  exportHandover: (issueId) => {
+    const { issues, reviewPlans, planConflicts, histories, currentUser, stores, addToast } = get();
+    const issue = issues.find(i => i.id === issueId);
+    if (!issue || !currentUser) return;
+
+    if (!canExportHandover(currentUser, issue)) {
+      addToast('error', '无权导出该问题的交接包');
+      return;
+    }
+
+    const issuePlans = reviewPlans.filter(p => p.issueId === issueId);
+    const issuePlanConflicts = planConflicts.filter(pc => pc.issueId === issueId);
+    const store = stores.find(s => s.id === issue.storeId);
+
+    if (issuePlans.length === 0) {
+      addToast('warning', '该问题暂无复查计划，无法导出交接包');
+      return;
+    }
+
+    const pkg = buildHandoverPackage(
+      issue,
+      issuePlans,
+      issuePlanConflicts,
+      histories,
+      currentUser,
+      store?.name,
+    );
+
+    downloadHandoverPackage(pkg);
+
+    const now = new Date().toISOString();
+    const history: History = {
+      id: generateId(),
+      issueId,
+      action: 'plan_handover_export',
+      operatorId: currentUser.id,
+      operatorRole: currentUser.role,
+      timestamp: now,
+      remark: `导出交接包，包含 ${issuePlans.length} 条复查计划`,
+      planDetail: {
+        field: 'handover_export',
+        newValue: `${issuePlans.length} 条计划`,
+      },
+    };
+    db.addHistory(history).then(() => {
+      db.getAllHistories().then(allHistories => {
+        set({ histories: allHistories });
+      });
+    });
+
+    addToast('success', `交接包导出成功，包含 ${issuePlans.length} 条复查计划`);
+  },
+
+  previewHandoverImport: (rawData) => {
+    const { currentUser, reviewPlans, issues, addToast } = get();
+
+    if (!canImportHandover(currentUser)) {
+      addToast('error', '仅督导可导入交接包');
+      return null;
+    }
+
+    if (!isHandoverPackage(rawData)) {
+      addToast('error', '文件不是有效的交接包格式');
+      return null;
+    }
+
+    const pkg = rawData as HandoverPackage;
+    const issue = issues.find(i => i.id === pkg.issueId);
+    const issuePlans = reviewPlans.filter(p => p.issueId === pkg.issueId);
+
+    const validation = validateHandoverImport(rawData, issuePlans, currentUser, issue);
+    set({ lastHandoverValidation: validation });
+
+    return validation;
+  },
+
+  confirmHandoverImport: async (resolutions) => {
+    const { lastHandoverValidation, currentUser, issues, addToast } = get();
+    if (!lastHandoverValidation || !currentUser) {
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    if (!canImportHandover(currentUser)) {
+      addToast('error', '仅督导可导入交接包');
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    const pkg = lastHandoverValidation as HandoverValidationResult;
+    const issue = issues.find(i => i.id === (lastHandoverValidation as any).issueId);
+    let imported = 0;
+    let skipped = 0;
+    const now = new Date().toISOString();
+
+    for (const item of pkg.plans) {
+      if (!item.canImport) {
+        skipped++;
+        continue;
+      }
+
+      const resolution = resolutions[item.plan.id] || 'adopt_import';
+
+      if (resolution === 'keep_local' && item.localPlan) {
+        skipped++;
+        continue;
+      }
+
+      const resolvedPlan = applyHandoverResolution(item, resolution);
+      if (!resolvedPlan) {
+        skipped++;
+        continue;
+      }
+
+      const finalPlan: ReviewPlan = {
+        ...resolvedPlan,
+        issueId: item.plan.issueId,
+      };
+
+      if (item.localPlan) {
+        await db.updateReviewPlan(finalPlan);
+      } else {
+        await db.addReviewPlan(finalPlan);
+      }
+
+      await get().addPlanToSyncQueue(finalPlan, item.localPlan ? 'update' : 'create');
+
+      const history: History = {
+        id: generateId(),
+        issueId: finalPlan.issueId,
+        action: 'plan_handover_import',
+        operatorId: currentUser.id,
+        operatorRole: currentUser.role,
+        timestamp: now,
+        planId: finalPlan.id,
+        remark: `导入交接包计划，策略：${resolution === 'adopt_import' ? '采用导入版本' : resolution === 'merge' ? '合并备注与附件' : '保留本地'}`,
+        planDetail: {
+          field: 'handover_import',
+          newValue: resolution,
+          conflictResolution: resolution as any,
+          localVersion: item.localPlan,
+          remoteVersion: item.plan,
+        },
+      };
+      await db.addHistory(history);
+
+      imported++;
+    }
+
+    const [updatedPlans, updatedHistories, updatedSyncQueue] = await Promise.all([
+      db.getAllReviewPlans(),
+      db.getAllHistories(),
+      db.getAllSyncQueue(),
+    ]);
+    set({
+      reviewPlans: updatedPlans,
+      histories: updatedHistories,
+      syncQueue: updatedSyncQueue,
+      lastHandoverValidation: null,
+    });
+
+    if (imported > 0) {
+      addToast('success', `成功导入 ${imported} 条复查计划（跳过 ${skipped} 条）`);
+    } else {
+      addToast('info', `没有导入任何计划（跳过 ${skipped} 条）`);
+    }
+
+    return { success: true, imported, skipped };
+  },
+
+  clearHandoverValidation: () => {
+    set({ lastHandoverValidation: null });
   },
 
   addToast: (type, message) => {
