@@ -188,6 +188,8 @@ export const ACTION_LABELS: Record<HistoryAction, string> = {
   plan_sync_fail: '复查计划同步失败',
   plan_handover_export: '导出交接包',
   plan_handover_import: '导入交接包',
+  plan_handover_import_undo: '撤销交接包导入',
+  plan_handover_import_batch: '批量导入交接包',
   plan_delay_request: '申请延期',
   plan_delay_approve: '批准延期',
   plan_delay_reject: '驳回延期',

@@ -1,4 +1,4 @@
-import { UserRole, User, Issue, ReviewPlan } from '@/types';
+import { UserRole, User, Issue, ReviewPlan, HandoverImportBatch, HandoverImportPrecheckResult } from '@/types';
 
 export const PERMISSIONS: Record<UserRole, string[]> = {
   inspector: [
@@ -21,6 +21,7 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan:view_store',
     'plan_conflict:resolve_own',
     'handover:export_own',
+    'handover:precheck_view_store',
     'plan:delay_request_store',
     'plan:delay_approve_store',
   ],
@@ -39,6 +40,10 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan_conflict:resolve_all',
     'handover:export_all',
     'handover:import',
+    'handover:precheck_view_all',
+    'handover:import_confirm',
+    'handover:import_undo',
+    'handover:strategy_select',
     'plan:delay_request_all',
     'plan:delay_approve_all',
     'plan:time_conflict_resolve_all',
@@ -155,4 +160,55 @@ export function canResolveTimeConflict(user: User | null | undefined, plan: Revi
   if (!user || !plan) return false;
   if (hasPermission(user.role, 'plan:time_conflict_resolve_all')) return true;
   return canEditPlan(user, plan, issue);
+}
+
+export function canViewHandoverPrecheck(
+  user: User | null | undefined,
+  precheckResult: HandoverImportPrecheckResult | undefined,
+  issue?: Issue,
+): boolean {
+  if (!user || !precheckResult) return false;
+  if (hasPermission(user.role, 'handover:precheck_view_all')) return true;
+  if (hasPermission(user.role, 'handover:precheck_view_store') && issue) {
+    return user.storeId === issue.storeId;
+  }
+  return precheckResult.visibleToUserIds?.includes(user.id) || false;
+}
+
+export function canConfirmHandoverImport(
+  user: User | null | undefined,
+  precheckResult: HandoverImportPrecheckResult | undefined,
+  issue?: Issue,
+): boolean {
+  if (!user || !precheckResult) return false;
+  if (!hasPermission(user.role, 'handover:import_confirm')) return false;
+  return true;
+}
+
+export function canUndoHandoverImport(
+  user: User | null | undefined,
+  batch: HandoverImportBatch | undefined,
+): boolean {
+  if (!user || !batch) return false;
+  if (!hasPermission(user.role, 'handover:import_undo')) return false;
+  return batch.status === 'imported' && !batch.hasUndo;
+}
+
+export function canSelectHandoverStrategy(
+  user: User | null | undefined,
+  precheckResult: HandoverImportPrecheckResult | null | undefined,
+  issue?: Issue,
+): boolean {
+  if (!user || !precheckResult) return false;
+  if (hasPermission(user.role, 'handover:strategy_select')) return true;
+  return false;
+}
+
+export function canPrecheckHandoverImport(
+  user: User | null | undefined,
+): boolean {
+  if (!user) return false;
+  return hasPermission(user.role, 'handover:import') 
+    || hasPermission(user.role, 'handover:precheck_view_all')
+    || hasPermission(user.role, 'handover:precheck_view_store');
 }

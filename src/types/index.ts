@@ -102,6 +102,8 @@ export type PlanHistoryAction =
   | 'plan_sync_fail'
   | 'plan_handover_export'
   | 'plan_handover_import'
+  | 'plan_handover_import_undo'
+  | 'plan_handover_import_batch'
   | 'plan_delay_request'
   | 'plan_delay_approve'
   | 'plan_delay_reject'
@@ -122,6 +124,13 @@ export interface PlanHistoryDetail {
     remoteReviewTime: string;
     mergedRemark?: string;
   };
+  handoverBatch?: {
+    batchId: string;
+    strategy: 'keep_local' | 'adopt_import' | 'merge' | 'batch' | 'undo' | 'batch_undo';
+    isUndo?: boolean;
+  };
+  importedPlanIds?: string[];
+  undoPlanIds?: string[];
 }
 
 export interface Store {
@@ -332,6 +341,70 @@ export interface ImportValidationResult {
   templatesToUpgrade: Array<{ existing: Template; incoming: Template }>;
 }
 
+export type HandoverPrecheckGroup =
+  | 'direct_import'
+  | 'needs_merge'
+  | 'no_permission'
+  | 'issue_not_found'
+  | 'version_behind';
+
+export interface HandoverImportBatch {
+  id: string;
+  sourceHandoverPackage: HandoverPackage;
+  precheckResultId: string;
+  status: 'prechecking' | 'prechecked' | 'confirming' | 'imported' | 'undoing' | 'undone' | 'failed';
+  importedPlanIds: string[];
+  undoPlanSnapshots: Array<{ planId: string; snapshot: ReviewPlan }>;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  createdByRole: UserRole;
+  createdByName?: string;
+  importedAt?: string;
+  undoneAt?: string;
+  undoneBy?: string;
+  undoneByRole?: UserRole;
+  undoneByName?: string;
+  undoRemark?: string;
+  strategies: Record<string, 'keep_local' | 'adopt_import' | 'merge'>;
+  hasUndo: boolean;
+  schemaVersion: string;
+}
+
+export interface HandoverImportPrecheckResult {
+  id: string;
+  batchId: string;
+  handoverPackage: HandoverPackage;
+  groupedPlans: Record<HandoverPrecheckGroup, Array<HandoverPlanItem & { selectedResolution?: 'keep_local' | 'adopt_import' | 'merge' }>>;
+  selectedStrategies: Record<string, 'keep_local' | 'adopt_import' | 'merge'>;
+  impactSummary: {
+    totalPlans: number;
+    directImportCount: number;
+    needsMergeCount: number;
+    noPermissionCount: number;
+    issueNotFoundCount: number;
+    versionBehindCount: number;
+    newCount: number;
+    updateCount: number;
+  };
+  warnings: string[];
+  visibleToUserIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  createdByRole: UserRole;
+}
+
+export interface HandoverImportUndoRecord {
+  id: string;
+  batchId: string;
+  planId: string;
+  beforeImport: ReviewPlan | null;
+  afterImport: ReviewPlan;
+  restoredAt?: string;
+  restoredBy?: string;
+}
+
 export interface ExportPayload {
   issues: Issue[];
   stores: Store[];
@@ -341,6 +414,8 @@ export interface ExportPayload {
   reviewPlans: ReviewPlan[];
   unresolvedPlanConflicts: PlanConflict[];
   planDelayRecords?: PlanDelayRecord[];
+  handoverImportBatches?: HandoverImportBatch[];
+  handoverPrecheckResults?: HandoverImportPrecheckResult[];
   exportedAt: string;
   exportedBy?: {
     id: string;
@@ -365,6 +440,9 @@ export interface HandoverPlanItem {
   reason?: string;
   resolution?: 'keep_local' | 'adopt_import' | 'merge';
   mergedPlan?: ReviewPlan;
+  batchId?: string;
+  precheckGroup?: HandoverPrecheckGroup;
+  selectedResolution?: 'keep_local' | 'adopt_import' | 'merge';
 }
 
 export interface HandoverValidationResult {
@@ -410,4 +488,6 @@ export interface HandoverPackage {
     role: UserRole;
     name: string;
   };
+  handoverImportBatchId?: string;
+  hasUndo?: boolean;
 }

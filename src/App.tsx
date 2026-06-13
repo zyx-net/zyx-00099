@@ -12,6 +12,7 @@ import SyncQueue from '@/pages/SyncQueue';
 import History from '@/pages/History';
 import ConfigImport from '@/pages/ConfigImport';
 import Export from '@/pages/Export';
+import HandoverPrecheck from '@/pages/HandoverPrecheck';
 
 function ProtectedRoute({ children, permission }: { children: React.ReactNode; permission?: string }) {
   const { currentUser } = useAppStore();
@@ -109,6 +110,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute permission="export:data">
               <Export />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/handover-precheck"
+          element={
+            <ProtectedRoute>
+              <HandoverPrecheck />
             </ProtectedRoute>
           }
         />

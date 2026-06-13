@@ -20,8 +20,11 @@ import {
   PlanConflict,
   PlanDelayRecord,
   PlanDueStatus,
+  HandoverImportBatch,
+  HandoverImportPrecheckResult,
 } from '@/types';
 import { generateId, normalizeReviewPlanDefaults, DUE_STATUS_LABELS } from '@/utils/helpers';
+import { normalizeHandoverBatchDefaults, normalizeHandoverPrecheckResultDefaults } from './syncService';
 
 export function compareSemanticVersions(a: string, b: string): number {
   const partsA = a.split('.').map(Number);
@@ -465,7 +468,9 @@ export function buildExportPayload(
   currentUser?: User,
   reviewPlans: ReviewPlan[] = [],
   unresolvedPlanConflicts: PlanConflict[] = [],
-  planDelayRecords: PlanDelayRecord[] = []
+  planDelayRecords: PlanDelayRecord[] = [],
+  handoverImportBatches: HandoverImportBatch[] = [],
+  handoverPrecheckResults: HandoverImportPrecheckResult[] = []
 ): ExportPayload {
   const plansByDelay = new Map<string, PlanDelayRecord[]>();
   for (const rec of planDelayRecords) {
@@ -504,11 +509,13 @@ export function buildExportPayload(
     reviewPlans: normalizedPlans,
     unresolvedPlanConflicts,
     planDelayRecords,
+    handoverImportBatches,
+    handoverPrecheckResults,
     exportedAt: new Date().toISOString(),
     exportedBy: currentUser
       ? { id: currentUser.id, role: currentUser.role, name: currentUser.name }
       : undefined,
-    schemaVersion: '4.0',
+    schemaVersion: '5.0',
   };
 }
 
@@ -526,15 +533,18 @@ export function parseExportPayload(raw: any): {
   }
 
   const declaredVer: string = (raw.schemaVersion as string) || '1.0';
-  if (declaredVer !== '4.0') {
+  if (declaredVer !== '5.0') {
     warnings.push(
-      `📦 备份 schema 版本为 v${declaredVer}，当前支持 v4.0。已自动为缺失字段补充默认值，旧数据不会报废。`
+      `📦 备份 schema 版本为 v${declaredVer}，当前支持 v5.0。已自动为缺失字段补充默认值，旧数据不会报废。`
     );
     if (['1.0', '2.0'].includes(declaredVer)) {
       warnings.push(`  · 注意 v${declaredVer} 备份可能不包含「复查整改计划」，对应部分将为空。`);
     }
     if (['1.0', '2.0', '3.0'].includes(declaredVer)) {
       warnings.push(`  · 旧版本未包含「到期状态/延期记录/时间冲突」等字段，已补默认值（到期状态=normal、延期次数=0等）。`);
+    }
+    if (['1.0', '2.0', '3.0', '4.0'].includes(declaredVer)) {
+      warnings.push(`  · 旧版本未包含「交接包导入批次/预检结果/撤销标记」等字段，已补默认值。`);
     }
   }
 
@@ -547,6 +557,8 @@ export function parseExportPayload(raw: any): {
   if (!raw.reviewPlans) warnings.push('导入文件不包含复查整改计划，已用空数组代替。');
   if (!raw.unresolvedPlanConflicts) warnings.push('导入文件不包含复查计划冲突记录，已用空数组代替。');
   if (!raw.planDelayRecords) warnings.push('导入文件不包含延期申请记录，已用空数组代替。');
+  if (!raw.handoverImportBatches) warnings.push('导入文件不包含交接包导入批次记录，已用空数组代替。');
+  if (!raw.handoverPrecheckResults) warnings.push('导入文件不包含交接包预检记录，已用空数组代替。');
 
   if (errors.length > 0) {
     return { valid: false, warnings, errors };
@@ -559,6 +571,8 @@ export function parseExportPayload(raw: any): {
   if (!payload.reviewPlans) payload.reviewPlans = [];
   if (!payload.unresolvedPlanConflicts) payload.unresolvedPlanConflicts = [];
   (payload as any).planDelayRecords = (payload as any).planDelayRecords || [];
+  (payload as any).handoverImportBatches = (payload as any).handoverImportBatches || [];
+  (payload as any).handoverPrecheckResults = (payload as any).handoverPrecheckResults || [];
 
   for (const issue of payload.issues) {
     if (!issue.templateVersion) {
@@ -613,6 +627,42 @@ export function parseExportPayload(raw: any): {
     }
     if ((plan.attachments || []).some((a: any) => a.placeholder)) {
       warnings.push(`复查计划 ${plan.id} 包含占位附件，需重新上传。`);
+    }
+  }
+
+  const rawBatches = (payload as any).handoverImportBatches || [];
+  if (rawBatches.length > 0) {
+    const normalizedBatches: HandoverImportBatch[] = [];
+    for (let i = 0; i < rawBatches.length; i++) {
+      const batch = rawBatches[i];
+      const before = JSON.stringify(batch);
+      const normalized = normalizeHandoverBatchDefaults(batch);
+      normalizedBatches.push(normalized);
+      if (i < 2 && before !== JSON.stringify(normalized)) {
+        warnings.push(`交接包批次 ${batch.id.slice(0, 12)}… 已补齐默认字段`);
+      }
+    }
+    (payload as any).handoverImportBatches = normalizedBatches;
+    if (rawBatches.length > 2) {
+      warnings.push(`… 其余 ${rawBatches.length - 2} 个交接包批次同样已补齐默认字段。`);
+    }
+  }
+
+  const rawPrechecks = (payload as any).handoverPrecheckResults || [];
+  if (rawPrechecks.length > 0) {
+    const normalizedPrechecks: HandoverImportPrecheckResult[] = [];
+    for (let i = 0; i < rawPrechecks.length; i++) {
+      const pc = rawPrechecks[i];
+      const before = JSON.stringify(pc);
+      const normalized = normalizeHandoverPrecheckResultDefaults(pc);
+      normalizedPrechecks.push(normalized);
+      if (i < 2 && before !== JSON.stringify(normalized)) {
+        warnings.push(`交接包预检 ${pc.id.slice(0, 12)}… 已补齐默认字段`);
+      }
+    }
+    (payload as any).handoverPrecheckResults = normalizedPrechecks;
+    if (rawPrechecks.length > 2) {
+      warnings.push(`… 其余 ${rawPrechecks.length - 2} 个交接包预检记录同样已补齐默认字段。`);
     }
   }
 

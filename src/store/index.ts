@@ -5,7 +5,8 @@ import {
   FieldMapping, MigrationRecord, ImportValidationResult, TemplateDiff,
   ReviewPlan, PlanConflict, PlanAttachment, PlanSyncStatus, PlanHistoryDetail,
   SyncEntityType, HandoverValidationResult, HandoverPackage,
-  PlanDelayRecord, PlanDueStatus,
+  PlanDelayRecord, PlanDueStatus, HandoverImportBatch, HandoverImportPrecheckResult,
+  HandoverPrecheckGroup, HandoverPlanItem,
 } from '@/types';
 import * as db from '@/lib/db';
 import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName } from '@/utils/helpers';
@@ -16,12 +17,16 @@ import {
   diffReviewPlans, mergeReviewPlans, detectTimeConflict, mergePlanRemark,
   buildHandoverPackage, downloadHandoverPackage, validateHandoverImport,
   applyHandoverResolution, isHandoverPackage,
+  groupHandoverPlansForPrecheck, precheckHandoverImport,
+  normalizeHandoverPrecheckResultDefaults, normalizeHandoverBatchDefaults,
 } from '@/services/syncService';
 import {
   canManageIssue, canUpgradeTemplate, hasPermission,
   canCreatePlan, canEditPlan, canViewPlan, canResolvePlanConflict,
   canExportHandover, canImportHandover,
   canRequestDelay, canApproveDelay, canDirectlyChangeReviewTime, canResolveTimeConflict,
+  canViewHandoverPrecheck, canConfirmHandoverImport, canUndoHandoverImport, canSelectHandoverStrategy,
+  canPrecheckHandoverImport,
 } from '@/utils/permissions';
 import {
   diffTemplateVersions,
@@ -52,6 +57,10 @@ interface AppState {
   reviewPlans: ReviewPlan[];
   planConflicts: PlanConflict[];
   planDelayRecords: PlanDelayRecord[];
+  handoverImportBatches: HandoverImportBatch[];
+  handoverPrecheckResults: HandoverImportPrecheckResult[];
+  currentHandoverPrecheckId: string | null;
+  latestHandoverBatchId: string | null;
   toasts: ToastMessage[];
   isLoading: boolean;
   pendingUpgrades: PendingTemplateUpgrade[];
@@ -118,6 +127,14 @@ interface AppState {
   confirmHandoverImport: (resolutions: Record<string, 'keep_local' | 'adopt_import' | 'merge'>) => Promise<{ success: boolean; imported: number; skipped: number }>;
   clearHandoverValidation: () => void;
 
+  precheckHandoverImportBatch: (rawData: any) => Promise<{ batch: HandoverImportBatch; precheckResult: HandoverImportPrecheckResult } | null>;
+  updateHandoverImportStrategy: (planId: string, strategy: 'keep_local' | 'adopt_import' | 'merge') => void;
+  confirmHandoverImportBatch: () => Promise<{ success: boolean; imported: number; skipped: number }>;
+  undoLatestHandoverImport: (remark?: string) => Promise<{ success: boolean; restored: number; error?: string }>;
+  getLatestHandoverImportBatch: () => HandoverImportBatch | undefined;
+  getCurrentHandoverPrecheck: () => HandoverImportPrecheckResult | undefined;
+  clearCurrentHandoverPrecheck: () => void;
+
   addToast: (type: ToastMessage['type'], message: string) => void;
   removeToast: (id: string) => void;
 
@@ -139,6 +156,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   reviewPlans: [],
   planConflicts: [],
   planDelayRecords: [],
+  handoverImportBatches: [],
+  handoverPrecheckResults: [],
+  currentHandoverPrecheckId: null,
+  latestHandoverBatchId: null,
   toasts: [],
   isLoading: false,
   pendingUpgrades: [],
@@ -150,7 +171,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const [
         stores, templates, issues, syncQueue, conflicts, histories, migrations,
-        reviewPlans, planConflicts, planDelayRecords, currentUser
+        reviewPlans, planConflicts, planDelayRecords, currentUser,
+        handoverImportBatches, handoverPrecheckResults
       ] = await Promise.all([
         db.getAllStores(),
         db.getAllTemplates(),
@@ -162,7 +184,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         db.getAllReviewPlans(),
         db.getAllPlanConflicts(),
         db.getAllPlanDelayRecords(),
-        db.getCurrentUser()
+        db.getCurrentUser(),
+        db.getAllHandoverImportBatches(),
+        db.getAllHandoverPrecheckResults(),
       ]);
 
       const normalizedIssues = issues.map(issue => ({
@@ -182,10 +206,19 @@ export const useAppStore = create<AppState>((set, get) => ({
         };
       });
 
+      const normalizedPrechecks = handoverPrecheckResults.map(r => normalizeHandoverPrecheckResultDefaults(r));
+      const normalizedBatches = handoverImportBatches.map(b => normalizeHandoverBatchDefaults(b));
+      const latestBatch = [...normalizedBatches].sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      )[0];
+
       set({
         stores, templates, issues: normalizedIssues, syncQueue, conflicts,
         histories, migrations, reviewPlans: normalizedPlans, planConflicts,
         planDelayRecords, currentUser,
+        handoverImportBatches: normalizedBatches,
+        handoverPrecheckResults: normalizedPrechecks,
+        latestHandoverBatchId: latestBatch?.id || null,
         isLoading: false
       });
 
@@ -403,7 +436,45 @@ export const useAppStore = create<AppState>((set, get) => ({
       warnings.push(`已恢复 ${delayImported} 条延期申请/审批记录`);
     }
 
-    const [stores, templates, issues, conflicts, migrations, reviewPlans, planConflicts, planDelayRecords] = await Promise.all([
+    const handoverBatchesFromPayload = (payload as any).handoverImportBatches;
+    if (Array.isArray(handoverBatchesFromPayload) && handoverBatchesFromPayload.length > 0) {
+      const existingBatchIds = new Set((await db.getAllHandoverImportBatches()).map(b => b.id));
+      let batchImported = 0;
+      for (const batch of handoverBatchesFromPayload) {
+        if (existingBatchIds.has(batch.id)) continue;
+        try {
+          const normalized = normalizeHandoverBatchDefaults(batch);
+          await db.addHandoverImportBatch(normalized);
+          batchImported++;
+        } catch (e) {
+          warnings.push(`[交接包批次] 跳过 ${batch.id}：${(e as any)?.message || '已存在'}`);
+        }
+      }
+      if (batchImported > 0) {
+        warnings.push(`已恢复 ${batchImported} 条交接包导入批次记录`);
+      }
+    }
+
+    const handoverPrechecksFromPayload = (payload as any).handoverPrecheckResults;
+    if (Array.isArray(handoverPrechecksFromPayload) && handoverPrechecksFromPayload.length > 0) {
+      const existingPrecheckIds = new Set((await db.getAllHandoverPrecheckResults()).map(p => p.id));
+      let precheckImported = 0;
+      for (const pc of handoverPrechecksFromPayload) {
+        if (existingPrecheckIds.has(pc.id)) continue;
+        try {
+          const normalized = normalizeHandoverPrecheckResultDefaults(pc);
+          await db.addHandoverPrecheckResult(normalized);
+          precheckImported++;
+        } catch (e) {
+          warnings.push(`[交接包预检] 跳过 ${pc.id}：${(e as any)?.message || '已存在'}`);
+        }
+      }
+      if (precheckImported > 0) {
+        warnings.push(`已恢复 ${precheckImported} 条交接包预检记录`);
+      }
+    }
+
+    const [stores, templates, issues, conflicts, migrations, reviewPlans, planConflicts, planDelayRecords, handoverImportBatches, handoverPrecheckResults] = await Promise.all([
       db.getAllStores(),
       db.getAllTemplates(),
       db.getAllIssues(),
@@ -412,6 +483,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       db.getAllReviewPlans(),
       db.getAllPlanConflicts(),
       db.getAllPlanDelayRecords(),
+      db.getAllHandoverImportBatches(),
+      db.getAllHandoverPrecheckResults(),
     ]);
 
     const delayByPlan = new Map<string, PlanDelayRecord[]>();
@@ -431,7 +504,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       };
     });
 
-    set({ stores, templates, issues, conflicts, migrations, reviewPlans: finalPlans, planConflicts, planDelayRecords });
+    const restoredBatches = handoverImportBatches.map(b => normalizeHandoverBatchDefaults(b));
+    const restoredPrechecks = handoverPrecheckResults.map(r => normalizeHandoverPrecheckResultDefaults(r));
+    const latestBatch = [...restoredBatches].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0];
+
+    set({
+      stores, templates, issues, conflicts, migrations,
+      reviewPlans: finalPlans, planConflicts, planDelayRecords,
+      handoverImportBatches: restoredBatches,
+      handoverPrecheckResults: restoredPrechecks,
+      latestHandoverBatchId: latestBatch?.id || null,
+    });
 
     for (const w of warnings) get().addToast('info', w);
     for (const e of errors) get().addToast('error', e);
@@ -1898,6 +1983,431 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ lastHandoverValidation: null });
   },
 
+  precheckHandoverImportBatch: async (rawData) => {
+    const { currentUser, issues, reviewPlans, stores } = get();
+    if (!currentUser) {
+      get().addToast('error', '请先登录');
+      return null;
+    }
+    if (!canPrecheckHandoverImport(currentUser)) {
+      get().addToast('error', '权限不足，无法执行交接包预检');
+      return null;
+    }
+
+    try {
+      const issue = issues.find(i => i.id === rawData.issueId);
+      const validation = validateHandoverImport(rawData, reviewPlans, currentUser, issue);
+      const result = precheckHandoverImport(rawData, reviewPlans, currentUser, issues, stores);
+      await db.addHandoverImportBatch(result.batch);
+      await db.addHandoverPrecheckResult(result.precheckResult);
+
+      const normalizedBatch = normalizeHandoverBatchDefaults(result.batch);
+      const normalizedPrecheck = normalizeHandoverPrecheckResultDefaults(result.precheckResult);
+
+      set(state => ({
+        handoverImportBatches: [...state.handoverImportBatches, normalizedBatch],
+        handoverPrecheckResults: [...state.handoverPrecheckResults, normalizedPrecheck],
+        currentHandoverPrecheckId: normalizedPrecheck.id,
+        lastHandoverValidation: validation,
+      }));
+
+      get().addToast('success',
+        `预检完成：${result.precheckResult.groupedPlans.direct_import.length} 条可直接导入，` +
+        `${result.precheckResult.groupedPlans.needs_merge.length} 条需合并，` +
+        `${result.precheckResult.groupedPlans.no_permission.length} 条权限不足，` +
+        `${result.precheckResult.groupedPlans.issue_not_found.length} 条缺关联问题，` +
+        `${result.precheckResult.groupedPlans.version_behind.length} 条版本落后`
+      );
+
+      return { batch: normalizedBatch, precheckResult: normalizedPrecheck };
+    } catch (error) {
+      get().addToast('error', `预检失败：${(error as Error).message}`);
+      return null;
+    }
+  },
+
+  updateHandoverImportStrategy: async (planId, strategy) => {
+    const { currentUser, currentHandoverPrecheckId, handoverPrecheckResults } = get();
+    if (!currentUser || !currentHandoverPrecheckId) return false;
+
+    const precheckResult = handoverPrecheckResults.find(p => p.id === currentHandoverPrecheckId);
+    if (!precheckResult) return false;
+
+    const issue = get().issues.find(i => i.id === precheckResult.handoverPackage.issueId);
+    if (!canSelectHandoverStrategy(currentUser, precheckResult, issue)) {
+      get().addToast('error', '权限不足，无法修改导入策略');
+      return false;
+    }
+
+    const updatedStrategies = {
+      ...precheckResult.selectedStrategies,
+      [planId]: strategy,
+    };
+
+    const updatedGroups = { ...precheckResult.groupedPlans };
+    for (const groupName of Object.keys(updatedGroups) as HandoverPrecheckGroup[]) {
+      updatedGroups[groupName] = updatedGroups[groupName].map(item =>
+        item.plan.id === planId ? { ...item, selectedResolution: strategy } : item
+      );
+    }
+
+    const updated: HandoverImportPrecheckResult = {
+      ...precheckResult,
+      selectedStrategies: updatedStrategies,
+      groupedPlans: updatedGroups,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await db.updateHandoverPrecheckResult(updated);
+
+    set(state => ({
+      handoverPrecheckResults: state.handoverPrecheckResults.map(p =>
+        p.id === precheckResult.id ? normalizeHandoverPrecheckResultDefaults(updated) : p
+      ),
+    }));
+
+    return true;
+  },
+
+  confirmHandoverImportBatch: async () => {
+    const { currentUser, currentHandoverPrecheckId, handoverPrecheckResults, handoverImportBatches, reviewPlans, issues, stores } = get();
+    if (!currentUser || !currentHandoverPrecheckId) {
+      get().addToast('error', '没有可确认的导入批次');
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    const precheckResult = handoverPrecheckResults.find(p => p.id === currentHandoverPrecheckId);
+    if (!precheckResult) {
+      get().addToast('error', '预检结果不存在');
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    const issue = issues.find(i => i.id === precheckResult.handoverPackage.issueId);
+    if (!canConfirmHandoverImport(currentUser, precheckResult, issue)) {
+      get().addToast('error', '权限不足，无法确认导入');
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    const batch = handoverImportBatches.find(b => b.id === precheckResult.batchId);
+    if (!batch) {
+      get().addToast('error', '导入批次不存在');
+      return { success: false, imported: 0, skipped: 0 };
+    }
+
+    try {
+      const planMap = new Map(reviewPlans.map(p => [p.id, p]));
+      const allPlanItems: HandoverPlanItem[] = Object.values(precheckResult.groupedPlans).flat();
+      const undoPlanSnapshots: Array<{ planId: string; snapshot: ReviewPlan }> = [];
+      const importedPlanIds: string[] = [];
+      const skippedPlanIds: string[] = [];
+      const syncItems: SyncQueueItem[] = [];
+      const historyItems: History[] = [];
+      const finalStrategies: Record<string, 'keep_local' | 'adopt_import' | 'merge'> = {};
+      const finalPlans: ReviewPlan[] = [];
+
+      for (const item of allPlanItems) {
+        const planId = item.plan.id;
+        const strategy = precheckResult.selectedStrategies[planId] || item.selectedResolution || 'adopt_import';
+        finalStrategies[planId] = strategy;
+
+        if (strategy === 'keep_local' || !item.canImport) {
+          skippedPlanIds.push(planId);
+          continue;
+        }
+
+        const existingPlan = planMap.get(planId);
+        if (existingPlan) {
+          undoPlanSnapshots.push({ planId, snapshot: JSON.parse(JSON.stringify(existingPlan)) });
+        }
+
+        let finalPlan: ReviewPlan;
+        if (strategy === 'merge') {
+          const mergedAttachments = [
+            ...(existingPlan?.attachments || []),
+            ...(item.plan.attachments || []).map(a => ({ ...a, id: generateId() })),
+          ];
+          const mergedNote = existingPlan && existingPlan.rectificationNote && item.plan.rectificationNote
+            ? `${existingPlan.rectificationNote}\n\n[合并导入] ${item.plan.rectificationNote}`
+            : item.plan.rectificationNote || existingPlan?.rectificationNote || '';
+          finalPlan = {
+            ...item.plan,
+            rectificationNote: mergedNote,
+            attachments: mergedAttachments,
+            updatedAt: new Date().toISOString(),
+          };
+        } else {
+          finalPlan = {
+            ...item.plan,
+            updatedAt: new Date().toISOString(),
+          };
+        }
+
+        if (existingPlan) {
+          await db.updateReviewPlan(finalPlan);
+        } else {
+          await db.addReviewPlan(finalPlan);
+        }
+        importedPlanIds.push(planId);
+        finalPlans.push(finalPlan);
+
+        const syncItem = createPlanSyncQueueItem(finalPlan, existingPlan ? 'update' : 'create');
+        await db.addSyncQueueItem(syncItem);
+        syncItems.push(syncItem);
+
+        const planHistory: History = {
+          id: generateId(),
+          issueId: item.plan.issueId,
+          action: 'plan_handover_import',
+          operatorId: currentUser.id,
+          operatorRole: currentUser.role,
+          timestamp: new Date().toISOString(),
+          remark: `交接包导入，策略：${strategy === 'adopt_import' ? '采用导入' : strategy === 'merge' ? '合并备注和附件' : '保留本地'}`,
+          planId: finalPlan.id,
+          planDetail: {
+            handoverBatch: {
+              batchId: batch.id,
+              strategy,
+              isUndo: false,
+            },
+          },
+        };
+        await db.addHistory(planHistory);
+        historyItems.push(planHistory);
+      }
+
+      const batchHistory: History = {
+        id: generateId(),
+        issueId: batch.sourceHandoverPackage.issueId,
+        action: 'plan_handover_import_batch',
+        operatorId: currentUser.id,
+        operatorRole: currentUser.role,
+        timestamp: new Date().toISOString(),
+        remark: `交接包批量导入 ${importedPlanIds.length} 条计划`,
+        planDetail: {
+          handoverBatch: {
+            batchId: batch.id,
+            strategy: 'batch',
+            isUndo: false,
+          },
+          importedPlanIds,
+        },
+      };
+      await db.addHistory(batchHistory);
+      historyItems.push(batchHistory);
+
+      const updatedBatch: HandoverImportBatch = {
+        ...batch,
+        status: 'imported',
+        importedPlanIds,
+        undoPlanSnapshots,
+        strategies: finalStrategies,
+        hasUndo: false,
+        updatedAt: new Date().toISOString(),
+        importedAt: new Date().toISOString(),
+      };
+      await db.updateHandoverImportBatch(updatedBatch);
+
+      const updatedPrecheck: HandoverImportPrecheckResult = {
+        ...precheckResult,
+        selectedStrategies: finalStrategies,
+        updatedAt: new Date().toISOString(),
+      };
+      await db.updateHandoverPrecheckResult(updatedPrecheck);
+
+      const restoredBatches = handoverImportBatches.map(b =>
+        b.id === batch.id ? normalizeHandoverBatchDefaults(updatedBatch) : normalizeHandoverBatchDefaults(b)
+      );
+      const latestBatch = [...restoredBatches].sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      )[0];
+
+      set(state => ({
+        handoverImportBatches: restoredBatches,
+        handoverPrecheckResults: state.handoverPrecheckResults.map(p =>
+          p.id === precheckResult.id ? normalizeHandoverPrecheckResultDefaults(updatedPrecheck) : p
+        ),
+        reviewPlans: state.reviewPlans.filter(p => !importedPlanIds.includes(p.id)).concat(finalPlans),
+        syncQueue: [...state.syncQueue, ...syncItems],
+        histories: [...state.histories, ...historyItems],
+        currentHandoverPrecheckId: null,
+        latestHandoverBatchId: latestBatch?.id || null,
+      }));
+
+      get().addToast('success',
+        `导入成功：${importedPlanIds.length} 条计划已导入，` +
+        `${skippedPlanIds.length} 条保留本地`
+      );
+
+      return { success: true, imported: importedPlanIds.length, skipped: skippedPlanIds.length };
+    } catch (error) {
+      get().addToast('error', `导入失败：${(error as Error).message}`);
+      return { success: false, imported: 0, skipped: 0 };
+    }
+  },
+
+  undoLatestHandoverImport: async (remark) => {
+    const { currentUser, handoverImportBatches, reviewPlans } = get();
+    if (!currentUser) {
+      get().addToast('error', '请先登录');
+      return { success: false, restored: 0, error: '请先登录' };
+    }
+
+    const batch = [...handoverImportBatches].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0];
+
+    if (!batch) {
+      get().addToast('error', '没有可撤销的导入批次');
+      return { success: false, restored: 0, error: '没有可撤销的导入批次' };
+    }
+
+    if (!canUndoHandoverImport(currentUser, batch)) {
+      get().addToast('error', '权限不足或该批次已撤销');
+      return { success: false, restored: 0, error: '权限不足或该批次已撤销' };
+    }
+
+    try {
+      await db.updateHandoverImportBatch({ ...batch, status: 'undoing', updatedAt: new Date().toISOString() });
+
+      const planMap = new Map(reviewPlans.map(p => [p.id, p]));
+      const restoredPlans: ReviewPlan[] = [];
+      const deletedPlanIds: string[] = [];
+      const syncItems: SyncQueueItem[] = [];
+      const historyItems: History[] = [];
+
+      for (const snap of batch.undoPlanSnapshots) {
+        const existing = planMap.get(snap.planId);
+        const restored: ReviewPlan = {
+          ...snap.snapshot,
+          updatedAt: new Date().toISOString(),
+        };
+        if (existing) {
+          await db.updateReviewPlan(restored);
+          restoredPlans.push(restored);
+        } else {
+          await db.deleteReviewPlan(snap.planId);
+          deletedPlanIds.push(snap.planId);
+        }
+
+        const syncItem = createPlanSyncQueueItem(existing ? restored : snap.snapshot, existing ? 'update' : 'delete');
+        await db.addSyncQueueItem(syncItem);
+        syncItems.push(syncItem);
+
+        const planHistory: History = {
+          id: generateId(),
+          issueId: snap.snapshot.issueId,
+          action: 'plan_handover_import_undo',
+          operatorId: currentUser.id,
+          operatorRole: currentUser.role,
+          timestamp: new Date().toISOString(),
+          remark: `撤销交接包导入${remark ? `：${remark}` : ''}`,
+          planId: snap.planId,
+          planDetail: {
+            handoverBatch: {
+              batchId: batch.id,
+              strategy: 'undo',
+              isUndo: true,
+            },
+          },
+        };
+        await db.addHistory(planHistory);
+        historyItems.push(planHistory);
+      }
+
+      const newImportedIds = batch.importedPlanIds.filter(id => !batch.undoPlanSnapshots.some(s => s.planId === id));
+      for (const planId of newImportedIds) {
+        const existing = planMap.get(planId);
+        if (existing) {
+          await db.deleteReviewPlan(planId);
+          deletedPlanIds.push(planId);
+
+          const syncItem = createPlanSyncQueueItem(existing, 'delete');
+          await db.addSyncQueueItem(syncItem);
+          syncItems.push(syncItem);
+        }
+      }
+
+      const batchHistory: History = {
+        id: generateId(),
+        issueId: batch.sourceHandoverPackage.issueId,
+        action: 'plan_handover_import_undo',
+        operatorId: currentUser.id,
+        operatorRole: currentUser.role,
+        timestamp: new Date().toISOString(),
+        remark: `撤销交接包批量导入 ${batch.undoPlanSnapshots.length + newImportedIds.length} 条计划${remark ? `：${remark}` : ''}`,
+        planDetail: {
+          handoverBatch: {
+            batchId: batch.id,
+            strategy: 'batch_undo',
+            isUndo: true,
+          },
+          undoPlanIds: [...batch.undoPlanSnapshots.map(s => s.planId), ...newImportedIds],
+        },
+      };
+      await db.addHistory(batchHistory);
+      historyItems.push(batchHistory);
+
+      const updatedBatch: HandoverImportBatch = {
+        ...batch,
+        status: 'undone',
+        hasUndo: true,
+        updatedAt: new Date().toISOString(),
+        undoneAt: new Date().toISOString(),
+        undoneBy: currentUser.id,
+        undoneByRole: currentUser.role,
+        undoneByName: currentUser.name,
+        undoRemark: remark,
+      };
+      await db.updateHandoverImportBatch(updatedBatch);
+
+      set(state => {
+        const allUndoIds = [...batch.undoPlanSnapshots.map(s => s.planId), ...newImportedIds];
+        const newReviewPlans = state.reviewPlans
+          .filter(p => !allUndoIds.includes(p.id))
+          .concat(restoredPlans);
+
+        return {
+          handoverImportBatches: state.handoverImportBatches.map(b =>
+            b.id === batch.id ? normalizeHandoverBatchDefaults(updatedBatch) : normalizeHandoverBatchDefaults(b)
+          ),
+          reviewPlans: newReviewPlans,
+          syncQueue: [...state.syncQueue, ...syncItems],
+          histories: [...state.histories, ...historyItems],
+        };
+      });
+
+      const restoredCount = restoredPlans.length + deletedPlanIds.length;
+      get().addToast('success', `撤销成功：已回滚 ${restoredCount} 条计划`);
+
+      return { success: true, restored: restoredCount };
+    } catch (error) {
+      await db.updateHandoverImportBatch({ ...batch, status: 'imported', updatedAt: new Date().toISOString() });
+      const errorMsg = (error as Error).message;
+      get().addToast('error', `撤销失败：${errorMsg}`);
+      return { success: false, restored: 0, error: errorMsg };
+    }
+  },
+
+  getLatestHandoverImportBatch: () => {
+    const { handoverImportBatches, latestHandoverBatchId } = get();
+    if (latestHandoverBatchId) {
+      return handoverImportBatches.find(b => b.id === latestHandoverBatchId) || null;
+    }
+    return [...handoverImportBatches].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    )[0] || null;
+  },
+
+  getCurrentHandoverPrecheck: () => {
+    const { handoverPrecheckResults, currentHandoverPrecheckId } = get();
+    if (!currentHandoverPrecheckId) return null;
+    return handoverPrecheckResults.find(p => p.id === currentHandoverPrecheckId) || null;
+  },
+
+  clearCurrentHandoverPrecheck: () => {
+    set({ currentHandoverPrecheckId: null });
+  },
+
   addToast: (type, message) => {
     const id = generateId();
     set(state => ({ toasts: [...state.toasts, { id, type, message }] }));
@@ -1909,7 +2419,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   exportData: (format) => {
-    const { issues, stores, templates, migrations, conflicts, currentUser, reviewPlans, planConflicts, planDelayRecords } = get();
+    const { issues, stores, templates, migrations, conflicts, currentUser, reviewPlans, planConflicts, planDelayRecords, handoverImportBatches, handoverPrecheckResults } = get();
     const timestamp = new Date().toISOString().slice(0, 10);
     const unresolvedConflicts = conflicts.filter(c => c.status === 'pending');
     const unresolvedPlanConflicts = planConflicts.filter(c => c.status === 'pending');
@@ -1924,6 +2434,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         reviewPlans,
         unresolvedPlanConflicts,
         planDelayRecords,
+        handoverImportBatches,
+        handoverPrecheckResults,
         exportedAt: new Date().toISOString(),
         exportedBy: currentUser,
       };
@@ -1933,7 +2445,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     get().addToast('success',
       `数据导出成功（含 ${migrations.length} 条迁移，${unresolvedConflicts.length} 条问题冲突，` +
-      `${reviewPlans.length} 条复查计划，${unresolvedPlanConflicts.length} 条计划冲突）`
+      `${reviewPlans.length} 条复查计划，${unresolvedPlanConflicts.length} 条计划冲突，` +
+      `${handoverImportBatches.length} 条交接包批次，${handoverPrecheckResults.length} 条预检记录）`
     );
   },
 

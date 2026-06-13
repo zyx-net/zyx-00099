@@ -2148,6 +2148,16 @@ function hasPermissionV4(role, perm) {
   return ROLE_PERMISSIONS_V4[role]?.includes(perm) || false;
 }
 
+const ROLE_PERMISSIONS_V5 = {
+  ...ROLE_PERMISSIONS_V4,
+  manager: [...(ROLE_PERMISSIONS_V4.manager || []), 'handover:precheck_view_store'],
+  supervisor: [...(ROLE_PERMISSIONS_V4.supervisor || []), 'handover:precheck_view_all', 'handover:import_confirm', 'handover:import_undo', 'handover:strategy_select'],
+};
+
+function hasPermissionV5(role, perm) {
+  return ROLE_PERMISSIONS_V5[role]?.includes(perm) || false;
+}
+
 function canRequestDelay(user, plan, issue) {
   if (!user || !plan || !issue) return false;
   if (hasPermissionV4(user.role, 'plan:delay_request_all')) return true;
@@ -2681,6 +2691,502 @@ test('导入导出：JSON v4 含延期字段、旧备份缺字段自动补齐、
   assert(Array.isArray(v2FixedPayload.reviewPlans), 'v2 老备份导入不会报废：reviewPlans 被补为空数组或保留原值');
   assert(Array.isArray(v2FixedPayload.planDelayRecords), 'v2 老备份导入不会报废：planDelayRecords 被补为空数组');
   assert(v2FixedPayload.issues.length === 1, 'v2 老备份问题仍然存在，未报废');
+});
+
+// ========== 交接包导入增强：辅助函数 ==========
+
+function canPrecheckHandoverImport(user) {
+  return hasPermissionV5(user?.role, 'handover:precheck_view_all') ||
+         hasPermissionV5(user?.role, 'handover:precheck_view_store') ||
+         hasPermissionV5(user?.role, 'handover:import');
+}
+
+function canViewHandoverPrecheck(user, precheckResult, issue) {
+  if (!user || !precheckResult) return false;
+  if (hasPermissionV5(user.role, 'handover:precheck_view_all')) return true;
+  if (hasPermissionV5(user.role, 'handover:precheck_view_store') && issue) {
+    return user.storeId === issue.storeId;
+  }
+  return false;
+}
+
+function canConfirmHandoverImport(user, precheckResult, issue) {
+  if (!user || !precheckResult) return false;
+  return hasPermissionV5(user.role, 'handover:import_confirm');
+}
+
+function canUndoHandoverImport(user, batch) {
+  if (!user || !batch) return false;
+  if (!hasPermissionV5(user.role, 'handover:import_undo')) return false;
+  if (batch.status !== 'imported') return false;
+  if (batch.hasUndo) return false;
+  return true;
+}
+
+function canSelectHandoverStrategy(user, precheckResult, issue) {
+  if (!user || !precheckResult) return false;
+  return hasPermissionV5(user.role, 'handover:strategy_select');
+}
+
+function groupHandoverPlansForPrecheck(planItems) {
+  const groups = {
+    direct_import: [],
+    needs_merge: [],
+    no_permission: [],
+    issue_not_found: [],
+    version_behind: [],
+  };
+  for (const item of planItems) {
+    if (item.conflictTypes.includes('issue_not_found')) {
+      groups.issue_not_found.push(item);
+      continue;
+    }
+    if (item.conflictTypes.includes('no_permission')) {
+      groups.no_permission.push(item);
+      continue;
+    }
+    if (item.conflictTypes.includes('version_behind')) {
+      groups.version_behind.push(item);
+      continue;
+    }
+    if (item.conflictTypes.length > 0) {
+      groups.needs_merge.push(item);
+      continue;
+    }
+    groups.direct_import.push(item);
+  }
+  return groups;
+}
+
+function normalizeHandoverPrecheckResultDefaults(raw) {
+  const r = raw || {};
+  const sourcePkg = r.sourceHandoverPackage || {};
+  const groupedPlans = r.groupedPlans || {
+    direct_import: [], needs_merge: [], no_permission: [],
+    issue_not_found: [], version_behind: [],
+  };
+  return {
+    id: r.id || generateId(),
+    batchId: r.batchId || '',
+    sourceHandoverPackage: sourcePkg,
+    groupedPlans,
+    selectedStrategies: r.selectedStrategies || {},
+    impactSummary: r.impactSummary || null,
+    visibleToUserIds: r.visibleToUserIds || [],
+    createdAt: r.createdAt || new Date().toISOString(),
+    createdBy: r.createdBy || '',
+    createdByRole: r.createdByRole || 'inspector',
+    updatedAt: r.updatedAt || new Date().toISOString(),
+    schemaVersion: r.schemaVersion || '5.0',
+  };
+}
+
+function normalizeHandoverBatchDefaults(raw) {
+  const r = raw || {};
+  return {
+    id: r.id || generateId(),
+    sourceHandoverPackage: r.sourceHandoverPackage || {},
+    precheckResultId: r.precheckResultId || '',
+    status: r.status || 'prechecking',
+    importedPlanIds: r.importedPlanIds || [],
+    undoPlanSnapshots: r.undoPlanSnapshots || [],
+    createdAt: r.createdAt || new Date().toISOString(),
+    createdBy: r.createdBy || '',
+    createdByRole: r.createdByRole || 'inspector',
+    strategies: r.strategies || {},
+    hasUndo: r.hasUndo || false,
+    schemaVersion: r.schemaVersion || '5.0',
+    updatedAt: r.updatedAt || new Date().toISOString(),
+  };
+}
+
+function buildExportPayloadV5(issues, stores, templates, migrations, unresolvedConflicts,
+  reviewPlans, unresolvedPlanConflicts, planDelayRecords,
+  handoverImportBatches, handoverPrecheckResults, currentUser) {
+  const plansByDelay = new Map();
+  (planDelayRecords || []).forEach(rec => {
+    const arr = plansByDelay.get(rec.planId) || [];
+    arr.push(rec);
+    plansByDelay.set(rec.planId, arr);
+  });
+  const normalizedPlans = (reviewPlans || []).map(plan => {
+    const base = normalizeReviewPlanDefaults(plan);
+    const delayRecs = plansByDelay.get(plan.id) || base.delayRecords || [];
+    const pending = delayRecs.find(r => r.status === 'pending');
+    const approvedLast = [...delayRecs].filter(r => r.status === 'approved').sort(
+      (a, b) => new Date(b.requestedAt).getTime() - new Date(a.requestedAt).getTime()
+    )[0];
+    return {
+      ...base,
+      delayRecords: delayRecs,
+      pendingDelayRequest: pending,
+      delayCount: delayRecs.filter(r => r.status === 'approved').length,
+      lastDelayReason: approvedLast?.reason || base.lastDelayReason,
+      lastApproverId: approvedLast?.approverId || base.lastApproverId,
+      lastApproverName: approvedLast?.approverName || base.lastApproverName,
+      attachments: (base.attachments || []).map(att => ({
+        ...att, url: undefined, placeholder: true,
+      })),
+    };
+  });
+  return {
+    schemaVersion: '5.0',
+    issues, stores, templates, migrations, unresolvedConflicts,
+    reviewPlans: normalizedPlans, unresolvedPlanConflicts,
+    planDelayRecords: planDelayRecords || [],
+    handoverImportBatches: handoverImportBatches || [],
+    handoverPrecheckResults: handoverPrecheckResults || [],
+    exportedAt: new Date().toISOString(),
+    exportedBy: currentUser ? { id: currentUser.id, role: currentUser.role, name: currentUser.name } : undefined,
+  };
+}
+
+function parseExportPayloadV5(raw) {
+  const warnings = [];
+  const errors = [];
+
+  if (!raw || typeof raw !== 'object') {
+    return { valid: false, warnings, errors: ['导入文件不是有效的 JSON 对象'] };
+  }
+
+  const declaredVer = raw.schemaVersion || '1.0';
+  if (declaredVer !== '5.0') {
+    warnings.push(`📦 备份 schema 版本为 v${declaredVer}，当前支持 v5.0。已自动为缺失字段补充默认值。`);
+    if (['1.0', '2.0'].includes(declaredVer)) {
+      warnings.push(`  · 注意 v${declaredVer} 备份可能不包含「复查整改计划」，对应部分将为空。`);
+    }
+    if (['1.0', '2.0', '3.0'].includes(declaredVer)) {
+      warnings.push(`  · 旧版本未包含「到期状态/延期记录」等字段，已补默认值。`);
+    }
+    if (['1.0', '2.0', '3.0', '4.0'].includes(declaredVer)) {
+      warnings.push(`  · 旧版本未包含「交接包导入批次/预检结果/撤销标记」等字段，已补默认值。`);
+    }
+  }
+
+  if (!raw.handoverImportBatches) {
+    warnings.push('导入文件不包含交接包导入批次记录，已用空数组代替。');
+  }
+  if (!raw.handoverPrecheckResults) {
+    warnings.push('导入文件不包含交接包预检记录，已用空数组代替。');
+  }
+
+  const payload = raw;
+  payload.handoverImportBatches = (payload.handoverImportBatches || []).map(b => normalizeHandoverBatchDefaults(b));
+  payload.handoverPrecheckResults = (payload.handoverPrecheckResults || []).map(p => normalizeHandoverPrecheckResultDefaults(p));
+  payload.schemaVersion = '5.0';
+
+  return { valid: true, payload, warnings, errors };
+}
+
+// ========== 交接包导入增强：测试用例 ==========
+
+console.log('\n=== 交接包导入增强：权限拦截验证 ===\n');
+
+test('督导拥有所有交接包权限：预检、策略选择、确认导入、撤销', () => {
+  const precheckResult = normalizeHandoverPrecheckResultDefaults({
+    sourceHandoverPackage: { issueId: issueInA.id },
+  });
+  assert(canPrecheckHandoverImport(supervisor) === true, '督导可执行预检');
+  assert(canViewHandoverPrecheck(supervisor, precheckResult, issueInA) === true, '督导可查看所有预检');
+  assert(canSelectHandoverStrategy(supervisor, precheckResult, issueInA) === true, '督导可选择策略');
+  assert(canConfirmHandoverImport(supervisor, precheckResult, issueInA) === true, '督导可确认导入');
+  const importedBatch = normalizeHandoverBatchDefaults({ status: 'imported', hasUndo: false });
+  assert(canUndoHandoverImport(supervisor, importedBatch) === true, '督导可撤销导入');
+});
+
+test('店长仅能预览本店数据，不能选择策略、确认导入或撤销', () => {
+  const precheckResult = normalizeHandoverPrecheckResultDefaults({
+    sourceHandoverPackage: { issueId: issueInA.id },
+  });
+  assert(canPrecheckHandoverImport(managerA) === true, '店长可执行预检');
+  assert(canViewHandoverPrecheck(managerA, precheckResult, issueInA) === true, '店长A可查看本店A的预检');
+  assert(canViewHandoverPrecheck(managerA, precheckResult, issueInB) === false, '店长A不能查看门店B的预检');
+  assert(canSelectHandoverStrategy(managerA, precheckResult, issueInA) === false, '店长不能选择策略');
+  assert(canConfirmHandoverImport(managerA, precheckResult, issueInA) === false, '店长不能确认导入');
+  const importedBatch = normalizeHandoverBatchDefaults({ status: 'imported', hasUndo: false });
+  assert(canUndoHandoverImport(managerA, importedBatch) === false, '店长不能撤销导入');
+});
+
+test('巡检员无交接包权限', () => {
+  const precheckResult = normalizeHandoverPrecheckResultDefaults({
+    sourceHandoverPackage: { issueId: issueInA.id },
+  });
+  assert(canPrecheckHandoverImport(inspectorA) === false, '巡检员不能执行预检');
+  assert(canViewHandoverPrecheck(inspectorA, precheckResult, issueInA) === false, '巡检员不能查看预检');
+  assert(canSelectHandoverStrategy(inspectorA, precheckResult, issueInA) === false, '巡检员不能选择策略');
+  assert(canConfirmHandoverImport(inspectorA, precheckResult, issueInA) === false, '巡检员不能确认导入');
+});
+
+test('撤销权限拦截：只有 imported 状态且未撤销过的批次才能撤销', () => {
+  const batchImported = normalizeHandoverBatchDefaults({ status: 'imported', hasUndo: false });
+  const batchUndone = normalizeHandoverBatchDefaults({ status: 'imported', hasUndo: true });
+  const batchPrechecking = normalizeHandoverBatchDefaults({ status: 'prechecking', hasUndo: false });
+  assert(canUndoHandoverImport(supervisor, batchImported) === true, '正常已导入批次可撤销');
+  assert(canUndoHandoverImport(supervisor, batchUndone) === false, '已撤销过的批次不能重复撤销');
+  assert(canUndoHandoverImport(supervisor, batchPrechecking) === false, '未完成导入的批次不能撤销');
+});
+
+console.log('\n=== 交接包导入增强：冲突合并与分组验证 ===\n');
+
+test('预检分组优先级：issue_not_found > no_permission > version_behind > needs_merge > direct_import', () => {
+  const planItems = [
+    { planId: 'p1', conflictTypes: ['issue_not_found', 'version_behind'] },
+    { planId: 'p2', conflictTypes: ['no_permission', 'time_conflict'] },
+    { planId: 'p3', conflictTypes: ['version_behind', 'time_conflict'] },
+    { planId: 'p4', conflictTypes: ['time_conflict', 'assignee_mismatch'] },
+    { planId: 'p5', conflictTypes: [] },
+  ];
+  const groups = groupHandoverPlansForPrecheck(planItems);
+  assert(groups.issue_not_found.length === 1 && groups.issue_not_found[0].planId === 'p1',
+    '含 issue_not_found 的应进入 issue_not_found 组');
+  assert(groups.no_permission.length === 1 && groups.no_permission[0].planId === 'p2',
+    '含 no_permission 的应进入 no_permission 组');
+  assert(groups.version_behind.length === 1 && groups.version_behind[0].planId === 'p3',
+    '含 version_behind 的应进入 version_behind 组');
+  assert(groups.needs_merge.length === 1 && groups.needs_merge[0].planId === 'p4',
+    '其他冲突应进入 needs_merge 组');
+  assert(groups.direct_import.length === 1 && groups.direct_import[0].planId === 'p5',
+    '无冲突应进入 direct_import 组');
+});
+
+test('合并策略：备注和附件合并，其他字段采用导入版本', () => {
+  const localPlan = makeReviewPlan({
+    id: 'plan-merge',
+    remarks: [{ id: 'r1', content: '本地备注1' }],
+    attachments: [{ id: 'a1', name: '本地附件1.png' }],
+    version: 2,
+  });
+  const importPlan = makeReviewPlan({
+    id: 'plan-merge',
+    remarks: [{ id: 'r2', content: '导入备注1' }],
+    attachments: [{ id: 'a2', name: '导入附件1.png' }],
+    version: 3,
+    rectificationNote: '导入的整改说明',
+  });
+  const mergedRemarks = [
+    ...(localPlan.remarks || []),
+    ...(importPlan.remarks || []).map(r => ({ ...r, id: generateId() })),
+  ];
+  const mergedAttachments = [
+    ...(localPlan.attachments || []),
+    ...(importPlan.attachments || []).map(a => ({ ...a, id: generateId(), placeholder: true })),
+  ];
+  const finalPlan = {
+    ...importPlan,
+    remarks: mergedRemarks,
+    attachments: mergedAttachments,
+    version: 4,
+  };
+  assert(finalPlan.remarks.length === 2, '合并后备注数为 2');
+  assert(finalPlan.attachments.length === 2, '合并后附件数为 2');
+  assert(finalPlan.rectificationNote === '导入的整改说明', '其他字段采用导入版本');
+  assert(finalPlan.version === 4, '版本号递增');
+});
+
+test('采用导入策略：直接覆盖本地版本', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-adopt', version: 2, rectificationNote: '本地说明' });
+  const importPlan = makeReviewPlan({ id: 'plan-adopt', version: 3, rectificationNote: '导入说明' });
+  const finalPlan = { ...importPlan, version: 4 };
+  assert(finalPlan.rectificationNote === '导入说明', '采用导入版本的整改说明');
+  assert(finalPlan.version === 4, '版本号为 max+1');
+});
+
+test('保留本地策略：本地内容不变', () => {
+  const localPlan = makeReviewPlan({ id: 'plan-keep', version: 2, rectificationNote: '本地说明' });
+  const importPlan = makeReviewPlan({ id: 'plan-keep', version: 3, rectificationNote: '导入说明' });
+  const finalPlan = { ...localPlan };
+  assert(finalPlan.rectificationNote === '本地说明', '保留本地整改说明');
+  assert(finalPlan.version === 2, '版本号保持本地版本');
+});
+
+console.log('\n=== 交接包导入增强：跨重启恢复验证 ===\n');
+
+test('预检结果持久化后可恢复：normalizeHandoverPrecheckResultDefaults 补全缺失字段', () => {
+  const partialPrecheck = {
+    id: 'precheck-partial',
+    batchId: 'batch-001',
+    sourceHandoverPackage: { id: 'pkg-001', issueId: issueInA.id },
+  };
+  const normalized = normalizeHandoverPrecheckResultDefaults(partialPrecheck);
+  assert(normalized.id === 'precheck-partial', 'ID 保留');
+  assert(normalized.batchId === 'batch-001', 'batchId 保留');
+  assert(Array.isArray(normalized.groupedPlans.direct_import), 'groupedPlans 有默认值');
+  assert(typeof normalized.selectedStrategies === 'object', 'selectedStrategies 有默认值');
+  assert(normalized.createdAt.length > 0, 'createdAt 已补');
+  assert(normalized.schemaVersion === '5.0', 'schemaVersion 已补');
+});
+
+test('导入批次持久化后可恢复：normalizeHandoverBatchDefaults 补全缺失字段', () => {
+  const partialBatch = {
+    id: 'batch-partial',
+    sourceHandoverPackage: { id: 'pkg-001' },
+    status: 'imported',
+  };
+  const normalized = normalizeHandoverBatchDefaults(partialBatch);
+  assert(normalized.id === 'batch-partial', 'ID 保留');
+  assert(normalized.status === 'imported', 'status 保留');
+  assert(Array.isArray(normalized.importedPlanIds), 'importedPlanIds 有默认值');
+  assert(Array.isArray(normalized.undoPlanSnapshots), 'undoPlanSnapshots 有默认值');
+  assert(normalized.hasUndo === false, 'hasUndo 默认 false');
+  assert(normalized.createdAt.length > 0, 'createdAt 已补');
+});
+
+test('模拟 IndexedDB 恢复流程：空数组 + 遍历 normalize 不报错', () => {
+  const emptyBatches = [];
+  const emptyPrechecks = [];
+  const restoredBatches = emptyBatches.map(b => normalizeHandoverBatchDefaults(b));
+  const restoredPrechecks = emptyPrechecks.map(p => normalizeHandoverPrecheckResultDefaults(p));
+  assert(Array.isArray(restoredBatches), '空批次 normalize 后仍为数组');
+  assert(restoredBatches.length === 0, '空数组长度不变');
+  assert(Array.isArray(restoredPrechecks), '空预检 normalize 后仍为数组');
+});
+
+console.log('\n=== 交接包导入增强：撤销后数据回滚验证 ===\n');
+
+test('导入前保存 undoPlanSnapshots，撤销时按快照回滚', () => {
+  const originalPlan = makeReviewPlan({
+    id: 'plan-undo', version: 1, rectificationNote: '原始内容',
+    remarks: [{ id: 'r1', content: '原始备注' }],
+  });
+  const importPlan = makeReviewPlan({
+    id: 'plan-undo', version: 2, rectificationNote: '导入内容',
+    remarks: [{ id: 'r2', content: '导入备注' }],
+  });
+
+  const undoSnapshot = { planId: 'plan-undo', snapshot: JSON.parse(JSON.stringify(originalPlan)) };
+  const batch = normalizeHandoverBatchDefaults({
+    status: 'imported', hasUndo: false,
+    undoPlanSnapshots: [undoSnapshot],
+    importedPlanIds: ['plan-undo'],
+  });
+
+  assert(batch.undoPlanSnapshots.length === 1, '批次包含 1 个快照');
+  assert(batch.undoPlanSnapshots[0].snapshot.rectificationNote === '原始内容',
+    '快照保存了导入前的原始内容');
+
+  const restoredPlan = { ...batch.undoPlanSnapshots[0].snapshot, updatedAt: new Date().toISOString() };
+  assert(restoredPlan.rectificationNote === '原始内容', '回滚后内容恢复为原始值');
+  assert(restoredPlan.version === 1, '回滚后版本号恢复');
+  assert(restoredPlan.remarks[0].content === '原始备注', '回滚后备注恢复');
+});
+
+test('撤销后标记 hasUndo=true，防止重复撤销', () => {
+  const batch = normalizeHandoverBatchDefaults({
+    id: 'batch-undo-flag', status: 'imported', hasUndo: false,
+  });
+  assert(canUndoHandoverImport(supervisor, batch) === true, '撤销前可撤销');
+
+  const afterUndo = { ...batch, status: 'undone', hasUndo: true, updatedAt: new Date().toISOString() };
+  assert(canUndoHandoverImport(supervisor, afterUndo) === false, '撤销后 hasUndo=true，不能重复撤销');
+});
+
+test('操作历史记录：plan_handover_import / plan_handover_import_batch / plan_handover_import_undo', () => {
+  const planId = 'plan-history';
+  const batchId = 'batch-history';
+  const histories = [
+    {
+      id: generateId(), planId, action: 'plan_handover_import',
+      createdAt: new Date().toISOString(),
+      createdBy: supervisor.id, createdByName: supervisor.name, createdByRole: supervisor.role,
+      remark: '交接包导入，策略：采用导入',
+      detail: { handoverBatch: { batchId, strategy: 'adopt_import', isUndo: false } },
+    },
+    {
+      id: generateId(), planId: issueInA.id, action: 'plan_handover_import_batch',
+      createdAt: new Date().toISOString(),
+      createdBy: supervisor.id, createdByName: supervisor.name, createdByRole: supervisor.role,
+      remark: '交接包批量导入 1 条计划',
+      detail: {
+        handoverBatch: { batchId, strategy: 'batch', isUndo: false },
+        importedPlanIds: [planId],
+      },
+    },
+    {
+      id: generateId(), planId, action: 'plan_handover_import_undo',
+      createdAt: new Date().toISOString(),
+      createdBy: supervisor.id, createdByName: supervisor.name, createdByRole: supervisor.role,
+      remark: '撤销交接包导入：误操作',
+      detail: { handoverBatch: { batchId, strategy: 'undo', isUndo: true } },
+    },
+  ];
+  assert(histories[0].action === 'plan_handover_import', '单条导入动作正确');
+  assert(histories[0].detail.handoverBatch.batchId === batchId, '历史记录含 batchId');
+  assert(histories[0].detail.handoverBatch.isUndo === false, '导入时 isUndo=false');
+  assert(histories[1].action === 'plan_handover_import_batch', '批量导入动作正确');
+  assert(histories[1].detail.importedPlanIds.length === 1, '批量记录含导入计划列表');
+  assert(histories[2].action === 'plan_handover_import_undo', '撤销动作正确');
+  assert(histories[2].detail.handoverBatch.isUndo === true, '撤销时 isUndo=true');
+});
+
+console.log('\n=== 交接包导入增强：导入导出字段一致性验证 ===\n');
+
+test('buildExportPayloadV5 schemaVersion 为 5.0，包含 handover 字段', () => {
+  const testBatch = normalizeHandoverBatchDefaults({ id: 'batch-export' });
+  const testPrecheck = normalizeHandoverPrecheckResultDefaults({ id: 'precheck-export' });
+  const payload = buildExportPayloadV5(
+    [issueInA], [storeA], [templateV1], [], [], [], [], [],
+    [testBatch], [testPrecheck], supervisor
+  );
+  assert(payload.schemaVersion === '5.0', 'schemaVersion 应为 5.0');
+  assert(Array.isArray(payload.handoverImportBatches), '包含 handoverImportBatches 数组');
+  assert(payload.handoverImportBatches.length === 1, '批次数据完整');
+  assert(Array.isArray(payload.handoverPrecheckResults), '包含 handoverPrecheckResults 数组');
+  assert(payload.handoverPrecheckResults.length === 1, '预检数据完整');
+});
+
+test('parseExportPayloadV5 处理旧版本：v1-v4 自动补 handover 字段并给出警告', () => {
+  const v4Payload = {
+    schemaVersion: '4.0',
+    issues: [issueInA], stores: [storeA], templates: [templateV1],
+    migrations: [], unresolvedConflicts: [], reviewPlans: [],
+    unresolvedPlanConflicts: [], planDelayRecords: [],
+  };
+  const parsed = parseExportPayloadV5(v4Payload);
+  assert(parsed.valid === true, 'v4 旧数据应仍可导入');
+  assert(parsed.warnings.some(w => w.includes('交接包导入批次')), '应给出 handover 字段缺失警告');
+  assert(Array.isArray(parsed.payload.handoverImportBatches), 'handoverImportBatches 已补空数组');
+  assert(Array.isArray(parsed.payload.handoverPrecheckResults), 'handoverPrecheckResults 已补空数组');
+  assert(parsed.payload.schemaVersion === '5.0', 'schemaVersion 已升级到 5.0');
+});
+
+test('v5 导出再导入往返一致性：批次和预检字段完整保留', () => {
+  const originalBatch = normalizeHandoverBatchDefaults({
+    id: 'batch-roundtrip', status: 'imported', hasUndo: false,
+    importedPlanIds: ['plan-1', 'plan-2'],
+  });
+  const originalPrecheck = normalizeHandoverPrecheckResultDefaults({
+    id: 'precheck-roundtrip', batchId: 'batch-roundtrip',
+    selectedStrategies: { 'plan-1': 'adopt_import', 'plan-2': 'keep_local' },
+  });
+
+  const exported = buildExportPayloadV5(
+    [issueInA], [storeA], [templateV1], [], [], [], [], [],
+    [originalBatch], [originalPrecheck], supervisor
+  );
+  const parsed = parseExportPayloadV5(exported);
+
+  assert(parsed.payload.handoverImportBatches.length === 1, '往返后批次数量一致');
+  assert(parsed.payload.handoverPrecheckResults.length === 1, '往返后预检数量一致');
+  assert(parsed.payload.handoverImportBatches[0].id === 'batch-roundtrip', '批次 ID 保留');
+  assert(parsed.payload.handoverImportBatches[0].status === 'imported', '批次状态保留');
+  assert(parsed.payload.handoverPrecheckResults[0].selectedStrategies['plan-1'] === 'adopt_import',
+    '策略选择保留');
+  assert(parsed.payload.handoverPrecheckResults[0].selectedStrategies['plan-2'] === 'keep_local',
+    '策略选择保留');
+});
+
+test('旧备份缺 handover 字段不报废数据：给出可读提示并补默认值', () => {
+  const veryOld = {
+    schemaVersion: '1.0',
+    issues: [{ id: 'i-old', title: '超老备份问题', storeId: storeA.id, templateId: templateV1.id, status: 'draft', priority: 'medium', data: {}, creatorId: 'me', synced: false, version: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }],
+    stores: [storeA], templates: [templateV1],
+  };
+  const parsed = parseExportPayloadV5(veryOld);
+  assert(parsed.valid === true, 'v1.0 老数据不应报废');
+  assert(parsed.warnings.some(w => w.includes('交接包导入批次')), '有 handover 字段缺失提示');
+  assert(parsed.warnings.some(w => w.includes('已自动为缺失字段补充默认值')), '有自动补默认值提示');
+  assert(Array.isArray(parsed.payload.handoverImportBatches), 'handoverImportBatches 已补空数组');
+  assert(parsed.payload.issues.length === 1, '原有问题数据未丢失');
 });
 
 console.log('\n=== 结果统计 ===');

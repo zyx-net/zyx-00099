@@ -2,6 +2,7 @@ import {
   Issue, Conflict, SyncQueueItem, Template, Store, MigrationRecord,
   ReviewPlan, PlanConflict, PlanDelayRecord, PlanSyncStatus, User, History,
   HandoverPackage, HandoverValidationResult, HandoverPlanItem, HandoverConflictType,
+  HandoverPrecheckGroup, HandoverImportBatch, HandoverImportPrecheckResult,
 } from '@/types';
 import { generateId } from '@/utils/helpers';
 import { buildExportPayload, generateCSVWithVersions, diffTemplateVersions } from './templateVersionService';
@@ -273,6 +274,8 @@ export function exportToJSON(
     reviewPlans?: ReviewPlan[];
     unresolvedPlanConflicts?: PlanConflict[];
     planDelayRecords?: PlanDelayRecord[];
+    handoverImportBatches?: HandoverImportBatch[];
+    handoverPrecheckResults?: HandoverImportPrecheckResult[];
     exportedAt?: string;
     exportedBy?: { id: string; role: any; name: string };
   }
@@ -287,6 +290,8 @@ export function exportToJSON(
     data.reviewPlans || [],
     data.unresolvedPlanConflicts || [],
     data.planDelayRecords || [],
+    data.handoverImportBatches || [],
+    data.handoverPrecheckResults || [],
   );
   return JSON.stringify(payload, null, 2);
 }
@@ -598,4 +603,194 @@ export function applyHandoverResolution(
   }
 
   return null;
+}
+
+export function groupHandoverPlansForPrecheck(
+  planItems: HandoverPlanItem[],
+): Record<HandoverPrecheckGroup, HandoverPlanItem[]> {
+  const groups: Record<HandoverPrecheckGroup, HandoverPlanItem[]> = {
+    direct_import: [],
+    needs_merge: [],
+    no_permission: [],
+    issue_not_found: [],
+    version_behind: [],
+  };
+
+  for (const item of planItems) {
+    if (item.conflictTypes.includes('issue_not_found')) {
+      groups.issue_not_found.push(item);
+      continue;
+    }
+    if (item.conflictTypes.includes('no_permission')) {
+      groups.no_permission.push(item);
+      continue;
+    }
+    if (item.conflictTypes.includes('version_behind')) {
+      groups.version_behind.push(item);
+      continue;
+    }
+    if (item.conflictTypes.length > 0) {
+      groups.needs_merge.push(item);
+      continue;
+    }
+    groups.direct_import.push(item);
+  }
+
+  return groups;
+}
+
+export function precheckHandoverImport(
+  rawPkg: any,
+  existingPlans: ReviewPlan[],
+  currentUser: User,
+  issues: Issue[],
+  stores: Store[],
+): {
+  batch: HandoverImportBatch;
+  precheckResult: HandoverImportPrecheckResult;
+} {
+  const now = new Date();
+  const batchId = `batch-${now.getTime().toString(36)}`;
+  const precheckId = `precheck-${now.getTime().toString(36)}`;
+
+  if (!isHandoverPackage(rawPkg)) {
+    throw new Error('文件不是有效的交接包格式');
+  }
+
+  const pkg = rawPkg as HandoverPackage;
+  const issue = issues.find(i => i.id === pkg.issueId);
+  const issuePlans = existingPlans.filter(p => p.issueId === pkg.issueId);
+  const validation = validateHandoverImport(rawPkg, issuePlans, currentUser, issue);
+
+  const grouped = groupHandoverPlansForPrecheck(validation.plans);
+
+  const defaultStrategies: Record<string, 'keep_local' | 'adopt_import' | 'merge'> = {};
+  for (const item of validation.plans) {
+    if (!item.canImport) continue;
+    if (item.conflictTypes.includes('version_behind')) {
+      defaultStrategies[item.plan.id] = 'keep_local';
+    } else if (item.conflictTypes.includes('local_exists')) {
+      defaultStrategies[item.plan.id] = 'adopt_import';
+    } else {
+      defaultStrategies[item.plan.id] = 'adopt_import';
+    }
+  }
+
+  const impactSummary = {
+    totalPlans: validation.plans.length,
+    directImportCount: grouped.direct_import.filter(p => p.canImport).length,
+    needsMergeCount: grouped.needs_merge.filter(p => p.canImport).length,
+    noPermissionCount: grouped.no_permission.length,
+    issueNotFoundCount: grouped.issue_not_found.length,
+    versionBehindCount: grouped.version_behind.length,
+    newCount: validation.plans.filter(p => !p.localPlan && p.canImport).length,
+    updateCount: validation.plans.filter(p => p.localPlan && p.canImport).length,
+  };
+
+  const pkgWithSchema = {
+    ...pkg,
+    schemaVersion: pkg.schemaVersion || '1.0',
+  };
+
+  const visibleToUserIds = [currentUser.id];
+  if (currentUser.role === 'manager' && issue) {
+    const sameStoreManagers = stores
+      .filter(s => s.id === issue.storeId)
+      .map(() => currentUser.id);
+    sameStoreManagers.forEach(id => { if (!visibleToUserIds.includes(id)) visibleToUserIds.push(id); });
+  }
+
+  const batch: HandoverImportBatch = {
+    id: batchId,
+    sourceHandoverPackage: pkgWithSchema,
+    precheckResultId: precheckId,
+    status: 'prechecked',
+    importedPlanIds: [],
+    undoPlanSnapshots: [],
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    createdBy: currentUser.id,
+    createdByRole: currentUser.role,
+    createdByName: currentUser.name,
+    strategies: defaultStrategies,
+    hasUndo: false,
+    schemaVersion: '2.0',
+  };
+
+  const precheckResult: HandoverImportPrecheckResult = {
+    id: precheckId,
+    batchId,
+    handoverPackage: pkgWithSchema,
+    groupedPlans: Object.fromEntries(
+      Object.entries(grouped).map(([k, v]) => [k, v.map(p => ({
+        ...p,
+        batchId,
+        precheckGroup: k as HandoverPrecheckGroup,
+        selectedResolution: defaultStrategies[p.plan.id],
+      }))])
+    ) as any,
+    selectedStrategies: defaultStrategies,
+    impactSummary,
+    warnings: validation.warnings,
+    visibleToUserIds,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    createdBy: currentUser.id,
+    createdByRole: currentUser.role,
+  };
+
+  return { batch, precheckResult };
+}
+
+export function normalizeHandoverPrecheckResultDefaults(
+  partial: Partial<HandoverImportPrecheckResult>,
+): HandoverImportPrecheckResult {
+  const p = partial || {};
+  const emptyGroups: Record<HandoverPrecheckGroup, any[]> = {
+    direct_import: [],
+    needs_merge: [],
+    no_permission: [],
+    issue_not_found: [],
+    version_behind: [],
+  };
+  return {
+    id: p.id || generateId(),
+    batchId: p.batchId || '',
+    handoverPackage: p.handoverPackage || ({} as HandoverPackage),
+    groupedPlans: p.groupedPlans || emptyGroups,
+    selectedStrategies: p.selectedStrategies || {},
+    impactSummary: p.impactSummary || {
+      totalPlans: 0, directImportCount: 0, needsMergeCount: 0,
+      noPermissionCount: 0, issueNotFoundCount: 0, versionBehindCount: 0,
+      newCount: 0, updateCount: 0,
+    },
+    warnings: p.warnings || [],
+    visibleToUserIds: p.visibleToUserIds || [],
+    createdAt: p.createdAt || new Date().toISOString(),
+    updatedAt: p.updatedAt || new Date().toISOString(),
+    createdBy: p.createdBy || '',
+    createdByRole: p.createdByRole || 'supervisor',
+  };
+}
+
+export function normalizeHandoverBatchDefaults(
+  partial: Partial<HandoverImportBatch>,
+): HandoverImportBatch {
+  const p = partial || {};
+  return {
+    id: p.id || generateId(),
+    sourceHandoverPackage: p.sourceHandoverPackage || ({} as HandoverPackage),
+    precheckResultId: p.precheckResultId || '',
+    status: p.status || 'prechecked',
+    importedPlanIds: p.importedPlanIds || [],
+    undoPlanSnapshots: p.undoPlanSnapshots || [],
+    createdAt: p.createdAt || new Date().toISOString(),
+    updatedAt: p.updatedAt || new Date().toISOString(),
+    createdBy: p.createdBy || '',
+    createdByRole: p.createdByRole || 'supervisor',
+    createdByName: p.createdByName || '',
+    strategies: p.strategies || {},
+    hasUndo: p.hasUndo || false,
+    schemaVersion: p.schemaVersion || '2.0',
+  };
 }

@@ -1,12 +1,12 @@
 import { openDB, IDBPDatabase } from 'idb';
 import {
   Issue, Store, Template, History, Conflict, SyncQueueItem, User, MigrationRecord,
-  ReviewPlan, PlanConflict, PlanDelayRecord
+  ReviewPlan, PlanConflict, PlanDelayRecord, HandoverImportBatch, HandoverImportPrecheckResult
 } from '@/types';
 import { normalizeReviewPlanDefaults } from '@/utils/helpers';
 
 const DB_NAME = 'inspection-pwa-db';
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 
 export interface DBSchema {
   users: { key: string; value: User };
@@ -20,6 +20,8 @@ export interface DBSchema {
   reviewPlans: { key: string; value: ReviewPlan; indexes: { 'by-issue': string; 'by-assignee': string; 'by-status': string; 'by-creator': string; 'by-due-status': string } };
   planConflicts: { key: string; value: PlanConflict; indexes: { 'by-issue': string; 'by-plan': string } };
   planDelayRecords: { key: string; value: PlanDelayRecord; indexes: { 'by-plan': string; 'by-issue': string; 'by-status': string; 'by-requester': string; 'by-approver': string } };
+  handoverImportBatches: { key: string; value: HandoverImportBatch; indexes: { 'by-status': string; 'by-creator': string; 'by-created-at': string } };
+  handoverPrecheckResults: { key: string; value: HandoverImportPrecheckResult; indexes: { 'by-batch': string; 'by-creator': string } };
 }
 
 let db: IDBPDatabase<DBSchema> | null = null;
@@ -130,6 +132,19 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
         const planIdxStore = (planTx as any).store;
         if (!planIdxStore.indexNames.contains('by-due-status')) {
           try { planIdxStore.createIndex('by-due-status', 'dueStatus'); } catch { /* ignore */ }
+        }
+      }
+      if (oldVersion < 5) {
+        if (!db.objectStoreNames.contains('handoverImportBatches')) {
+          const hbStore = db.createObjectStore('handoverImportBatches', { keyPath: 'id' });
+          hbStore.createIndex('by-status', 'status');
+          hbStore.createIndex('by-creator', 'createdBy');
+          hbStore.createIndex('by-created-at', 'createdAt');
+        }
+        if (!db.objectStoreNames.contains('handoverPrecheckResults')) {
+          const hpStore = db.createObjectStore('handoverPrecheckResults', { keyPath: 'id' });
+          hpStore.createIndex('by-batch', 'batchId');
+          hpStore.createIndex('by-creator', 'createdBy');
         }
       }
     },
@@ -414,7 +429,7 @@ export async function updatePlanDelayRecord(record: PlanDelayRecord): Promise<st
 export async function clearAllData(): Promise<void> {
   const database = await initDB();
   const tx = database.transaction(
-    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords'],
+    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords', 'handoverImportBatches', 'handoverPrecheckResults'],
     'readwrite'
   );
   await Promise.all([
@@ -428,6 +443,60 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore('reviewPlans').clear(),
     tx.objectStore('planConflicts').clear(),
     tx.objectStore('planDelayRecords').clear(),
+    tx.objectStore('handoverImportBatches').clear(),
+    tx.objectStore('handoverPrecheckResults').clear(),
     tx.done,
   ]);
+}
+
+export async function getAllHandoverImportBatches(): Promise<HandoverImportBatch[]> {
+  const database = await initDB();
+  return database.getAll('handoverImportBatches');
+}
+
+export async function getHandoverImportBatchById(id: string): Promise<HandoverImportBatch | undefined> {
+  const database = await initDB();
+  return database.get('handoverImportBatches', id);
+}
+
+export async function getLatestHandoverImportBatch(): Promise<HandoverImportBatch | undefined> {
+  const database = await initDB();
+  const all = await database.getAll('handoverImportBatches');
+  return all.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+}
+
+export async function addHandoverImportBatch(batch: HandoverImportBatch): Promise<string> {
+  const database = await initDB();
+  return database.add('handoverImportBatches', batch) as Promise<string>;
+}
+
+export async function updateHandoverImportBatch(batch: HandoverImportBatch): Promise<string> {
+  const database = await initDB();
+  return database.put('handoverImportBatches', batch) as Promise<string>;
+}
+
+export async function getAllHandoverPrecheckResults(): Promise<HandoverImportPrecheckResult[]> {
+  const database = await initDB();
+  return database.getAll('handoverPrecheckResults');
+}
+
+export async function getHandoverPrecheckResultById(id: string): Promise<HandoverImportPrecheckResult | undefined> {
+  const database = await initDB();
+  return database.get('handoverPrecheckResults', id);
+}
+
+export async function getHandoverPrecheckResultByBatchId(batchId: string): Promise<HandoverImportPrecheckResult | undefined> {
+  const database = await initDB();
+  const results = await database.getAllFromIndex('handoverPrecheckResults', 'by-batch', batchId);
+  return results[0];
+}
+
+export async function addHandoverPrecheckResult(result: HandoverImportPrecheckResult): Promise<string> {
+  const database = await initDB();
+  return database.add('handoverPrecheckResults', result) as Promise<string>;
+}
+
+export async function updateHandoverPrecheckResult(result: HandoverImportPrecheckResult): Promise<string> {
+  const database = await initDB();
+  return database.put('handoverPrecheckResults', result) as Promise<string>;
 }
