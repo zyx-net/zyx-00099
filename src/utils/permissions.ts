@@ -1,4 +1,4 @@
-import { UserRole, User, Issue, ReviewPlan, HandoverImportBatch, HandoverImportPrecheckResult, MaterialBorrowForm } from '@/types';
+import { UserRole, User, Issue, ReviewPlan, HandoverImportBatch, HandoverImportPrecheckResult, MaterialBorrowForm, CheckIn } from '@/types';
 
 export const PERMISSIONS: Record<UserRole, string[]> = {
   inspector: [
@@ -13,6 +13,8 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'material:borrow_own',
     'material:return_own',
     'material:view_own_borrow',
+    'patrol:checkin',
+    'patrol:view_own_checkin',
   ],
   manager: [
     'issue:view_all',
@@ -33,6 +35,7 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'material:view_store_borrow',
     'material:borrow_store',
     'material:return_store',
+    'patrol:view_store_checkin',
   ],
   supervisor: [
     'issue:view_all',
@@ -63,6 +66,9 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'material:borrow_all',
     'material:return_all',
     'material:export',
+    'patrol:route_manage',
+    'patrol:view_all_checkin',
+    'patrol:export',
   ]
 };
 
@@ -286,4 +292,28 @@ export function canViewStoreOccupancy(user: User | null | undefined, storeId?: s
 
 export function canExportMaterial(user: User | null | undefined): boolean {
   return hasPermission(user?.role, 'material:export');
+}
+
+export function canManagePatrolRoute(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'patrol:route_manage');
+}
+
+export function canCheckInPatrol(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'patrol:checkin');
+}
+
+export function canViewPatrolCheckIn(user: User | null | undefined, checkIn?: CheckIn): boolean {
+  if (!user) return false;
+  if (hasPermission(user.role, 'patrol:view_all_checkin')) return true;
+  if (hasPermission(user.role, 'patrol:view_store_checkin') && checkIn) {
+    return user.storeId === checkIn.storeId;
+  }
+  if (hasPermission(user.role, 'patrol:view_own_checkin') && checkIn) {
+    return user.id === checkIn.inspectorId;
+  }
+  return false;
+}
+
+export function canExportPatrol(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'patrol:export');
 }

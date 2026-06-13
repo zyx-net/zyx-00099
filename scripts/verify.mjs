@@ -3,9 +3,9 @@ function generateId() {
 }
 
 const ROLE_PERMISSIONS = {
-  inspector: ['issue:create', 'issue:edit_own', 'issue:view_own', 'plan:view_own'],
-  manager: ['issue:view_all', 'issue:close', 'export:data', 'plan:create', 'plan:edit_own', 'plan:view_store', 'plan_conflict:resolve_own', 'handover:export_own'],
-  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all', 'handover:export_all', 'handover:import']
+  inspector: ['issue:create', 'issue:edit_own', 'issue:view_own', 'plan:view_own', 'patrol:checkin', 'patrol:view_own_checkin'],
+  manager: ['issue:view_all', 'issue:close', 'export:data', 'plan:create', 'plan:edit_own', 'plan:view_store', 'plan_conflict:resolve_own', 'handover:export_own', 'patrol:view_store_checkin'],
+  supervisor: ['issue:view_all', 'issue:close', 'issue:reject', 'issue:create', 'template:import', 'template:upgrade', 'store:manage', 'sync:manage', 'conflict:resolve', 'export:data', 'plan:create', 'plan:edit_all', 'plan:view_all', 'plan_conflict:resolve_all', 'handover:export_all', 'handover:import', 'patrol:route_manage', 'patrol:view_all_checkin', 'patrol:export']
 };
 
 const DUE_STATUS_LABELS = {
@@ -3187,6 +3187,496 @@ test('旧备份缺 handover 字段不报废数据：给出可读提示并补默�
   assert(parsed.warnings.some(w => w.includes('已自动为缺失字段补充默认值')), '有自动补默认值提示');
   assert(Array.isArray(parsed.payload.handoverImportBatches), 'handoverImportBatches 已补空数组');
   assert(parsed.payload.issues.length === 1, '原有问题数据未丢失');
+});
+
+console.log('\n=== 巡店路线签到模块验证 ===\n');
+
+function isWithinTimeWindow(checkInTime, timeWindowStart, timeWindowEnd) {
+  const d = new Date(checkInTime);
+  const hh = d.getHours().toString().padStart(2, '0');
+  const mm = d.getMinutes().toString().padStart(2, '0');
+  const timeStr = `${hh}:${mm}`;
+  return timeStr >= timeWindowStart && timeStr <= timeWindowEnd;
+}
+
+function normalizePatrolRouteDefaults(partial) {
+  return {
+    id: partial.id || generateId(),
+    name: partial.name || '未命名路线',
+    version: typeof partial.version === 'number' ? partial.version : 1,
+    status: partial.status || 'active',
+    checkpoints: (partial.checkpoints || []).map(cp => ({
+      id: cp.id || generateId(),
+      routeId: cp.routeId || partial.id || generateId(),
+      name: cp.name || '未命名检查点',
+      order: typeof cp.order === 'number' ? cp.order : 0,
+      storeId: cp.storeId || '',
+      timeWindowStart: cp.timeWindowStart || '00:00',
+      timeWindowEnd: cp.timeWindowEnd || '23:59',
+      status: cp.status || 'active',
+      createdAt: cp.createdAt || new Date().toISOString(),
+      updatedAt: cp.updatedAt || new Date().toISOString(),
+    })),
+    creatorId: partial.creatorId || '',
+    creatorName: partial.creatorName || '',
+    creatorRole: partial.creatorRole || undefined,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+    synced: typeof partial.synced === 'boolean' ? partial.synced : false,
+  };
+}
+
+function normalizeCheckInDefaults(partial) {
+  return {
+    id: partial.id || generateId(),
+    routeId: partial.routeId || '',
+    routeVersion: typeof partial.routeVersion === 'number' ? partial.routeVersion : 1,
+    checkpointId: partial.checkpointId || '',
+    storeId: partial.storeId || '',
+    inspectorId: partial.inspectorId || '',
+    inspectorName: partial.inspectorName || '',
+    status: partial.status || 'draft',
+    checkInTime: partial.checkInTime || new Date().toISOString(),
+    exception: partial.exception || undefined,
+    remark: partial.remark || '',
+    syncStatus: partial.syncStatus || 'pending',
+    lastSyncError: partial.lastSyncError || undefined,
+    lastSyncAttempt: partial.lastSyncAttempt || undefined,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+  };
+}
+
+function validateCheckIn(checkIn, route, existingCheckIns, currentUserStoreId) {
+  const errors = [];
+  const warnings = [];
+  const options = [];
+
+  const duplicate = existingCheckIns.find(
+    c => c.checkpointId === checkIn.checkpointId
+      && c.inspectorId === checkIn.inspectorId
+      && c.status !== 'draft'
+      && c.id !== checkIn.id,
+  );
+  if (duplicate) {
+    errors.push('同一检查点不可重复签到');
+  }
+
+  if (!route) {
+    errors.push('签到路线不存在');
+  } else {
+    const checkpoint = route.checkpoints.find(cp => cp.id === checkIn.checkpointId);
+    if (!checkpoint) {
+      errors.push('检查点不在该路线上');
+    } else {
+      if (!isWithinTimeWindow(checkIn.checkInTime, checkpoint.timeWindowStart, checkpoint.timeWindowEnd)) {
+        warnings.push(`当前时间不在有效时间窗 [${checkpoint.timeWindowStart} - ${checkpoint.timeWindowEnd}] 内`);
+        options.push({ label: '记为异常签到', value: 'exception' });
+      }
+    }
+
+    if (checkIn.routeVersion !== route.version) {
+      warnings.push(`路线版本不一致（当前 v${route.version}，签到 v${checkIn.routeVersion}）`);
+      options.push({ label: '记为异常签到', value: 'exception' });
+    }
+  }
+
+  if (currentUserStoreId && checkIn.storeId !== currentUserStoreId) {
+    warnings.push('跨门店补签需补充异常说明');
+    options.push({ label: '记为异常签到', value: 'exception' });
+  }
+
+  options.push({ label: '保存草稿', value: 'draft' });
+  options.push({ label: '放弃提交', value: 'cancel' });
+
+  return { valid: errors.length === 0, errors, warnings, options };
+}
+
+function validatePatrolBackupImport(payload, existingRoutes, _currentUser) {
+  const warnings = [];
+  const errors = [];
+  const routesToImport = [];
+  const checkInsToImport = [];
+
+  const existingIds = new Set(existingRoutes.map(r => r.id));
+
+  for (const route of payload.patrolRoutes || []) {
+    if (!route.name) {
+      warnings.push({
+        type: 'patrol_missing_route_name',
+        routeId: route.id,
+        message: `路线 ${route.id} 缺少名称，已补默认值`,
+        missingFields: ['name'],
+        appliedDefaults: { name: '未命名路线' },
+      });
+      route.name = route.name || '未命名路线';
+    }
+    if (typeof route.version !== 'number' || route.version < 1) {
+      warnings.push({
+        type: 'patrol_invalid_route_version',
+        routeId: route.id,
+        routeName: route.name,
+        message: `路线「${route.name}」版本号无效，已补默认值 1`,
+        missingFields: ['version'],
+        appliedDefaults: { version: 1 },
+      });
+      route.version = 1;
+    }
+
+    for (const cp of route.checkpoints || []) {
+      if (!cp.name) {
+        warnings.push({
+          type: 'patrol_missing_checkpoint_name',
+          routeId: route.id,
+          routeName: route.name,
+          checkpointId: cp.id,
+          message: `路线「${route.name}」检查点 ${cp.id} 缺少名称，已补默认值`,
+          missingFields: ['name'],
+          appliedDefaults: { name: '未命名检查点' },
+        });
+        cp.name = cp.name || '未命名检查点';
+      }
+      if (!cp.timeWindowStart || !cp.timeWindowEnd) {
+        warnings.push({
+          type: 'patrol_missing_time_window',
+          routeId: route.id,
+          routeName: route.name,
+          checkpointId: cp.id,
+          message: `检查点「${cp.name}」缺少时间窗，已补全天`,
+          missingFields: ['timeWindowStart', 'timeWindowEnd'],
+          appliedDefaults: { timeWindowStart: '00:00', timeWindowEnd: '23:59' },
+        });
+        cp.timeWindowStart = cp.timeWindowStart || '00:00';
+        cp.timeWindowEnd = cp.timeWindowEnd || '23:59';
+      }
+    }
+
+    if (existingIds.has(route.id)) continue;
+    routesToImport.push(route);
+  }
+
+  const importedRouteIds = new Set(routesToImport.map(r => r.id));
+  for (const ci of payload.checkIns || []) {
+    if (!ci.inspectorId) {
+      warnings.push({
+        type: 'patrol_missing_inspector',
+        checkInId: ci.id,
+        message: `签到记录 ${ci.id} 缺少巡检员信息`,
+        missingFields: ['inspectorId'],
+      });
+    }
+    if (!importedRouteIds.has(ci.routeId) && !existingIds.has(ci.routeId)) {
+      warnings.push({
+        type: 'patrol_checkin_missing_route',
+        checkInId: ci.id,
+        routeId: ci.routeId,
+        message: `签到记录 ${ci.id} 对应路线不存在，将以草稿导入`,
+        appliedDefaults: { status: 'draft' },
+      });
+      ci.status = 'draft';
+    }
+    checkInsToImport.push(ci);
+  }
+
+  return { valid: errors.length === 0, warnings, errors, routesToImport, checkInsToImport };
+}
+
+const pstoreA = { id: 'store-a', name: '门店A', address: '地址A' };
+const pstoreB = { id: 'store-b', name: '门店B', address: '地址B' };
+
+const psupervisor = { id: 'user-sup', name: '王督导', role: 'supervisor', storeId: pstoreA.id };
+const pinspector = { id: 'user-insp', name: '李巡检', role: 'inspector', storeId: pstoreA.id };
+const pmanager = { id: 'user-mgr', name: '张经理', role: 'manager', storeId: pstoreA.id };
+
+const ptestCheckpoint = {
+  id: 'cp-1', routeId: 'route-1', name: '前台检查', order: 0,
+  storeId: pstoreA.id, timeWindowStart: '09:00', timeWindowEnd: '18:00',
+  status: 'active', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+};
+
+const ptestRoute = {
+  id: 'route-1', name: '日常巡店路线', version: 1, status: 'active',
+  checkpoints: [ptestCheckpoint],
+  creatorId: psupervisor.id, creatorName: psupervisor.name, creatorRole: psupervisor.role,
+  createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  synced: false,
+};
+
+test('巡检权限：督导可管理巡检路线', () => {
+  assert(hasPermission(psupervisor.role, 'patrol:route_manage') === true, '督导应可管理巡检路线');
+  assert(hasPermission(pmanager.role, 'patrol:route_manage') === false, '经理不应管理巡检路线');
+  assert(hasPermission(pinspector.role, 'patrol:route_manage') === false, '巡检员不应管理巡检路线');
+});
+
+test('巡检权限：巡检员可签到', () => {
+  assert(hasPermission(pinspector.role, 'patrol:checkin') === true, '巡检员应可签到');
+  assert(hasPermission(pmanager.role, 'patrol:checkin') === false, '经理不应签到');
+  assert(hasPermission(psupervisor.role, 'patrol:checkin') === false, '督导不应签到');
+});
+
+test('巡检权限：店长只能看本店签到', () => {
+  assert(hasPermission(pmanager.role, 'patrol:view_store_checkin') === true, '经理应可查看门店签到');
+  assert(hasPermission(pinspector.role, 'patrol:view_store_checkin') === false, '巡检员不应查看门店签到');
+});
+
+test('时间窗验证：工作时间内签到有效', () => {
+  const morningCheckIn = new Date();
+  morningCheckIn.setHours(10, 0, 0, 0);
+  assert(isWithinTimeWindow(morningCheckIn.toISOString(), '09:00', '18:00') === true, '10:00 应在 09:00-18:00 内');
+
+  const eveningCheckIn = new Date();
+  eveningCheckIn.setHours(20, 0, 0, 0);
+  assert(isWithinTimeWindow(eveningCheckIn.toISOString(), '09:00', '18:00') === false, '20:00 应不在 09:00-18:00 内');
+});
+
+test('重复签到拦截：同一检查点不能重复签到', () => {
+  const existingCheckIn = normalizeCheckInDefaults({
+    id: 'ci-existing', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreA.id, inspectorId: pinspector.id, status: 'submitted',
+  });
+
+  const newCheckIn = normalizeCheckInDefaults({
+    id: 'ci-new', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreA.id, inspectorId: pinspector.id, status: 'submitted',
+  });
+
+  const result = validateCheckIn(newCheckIn, ptestRoute, [existingCheckIn], undefined);
+  assert(result.valid === false, '重复签到应被拦截');
+  assert(result.errors.some(e => e.includes('同一检查点不可重复签到')), '应提示重复签到错误');
+  assert(result.options.some(o => o.value === 'draft'), '应包含保存草稿选项');
+  assert(result.options.some(o => o.value === 'cancel'), '应包含放弃提交选项');
+});
+
+test('超出时间窗：给出警告并提供异常签到选项', () => {
+  const earlyCheckIn = normalizeCheckInDefaults({
+    id: 'ci-early', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreA.id, inspectorId: pinspector.id, status: 'submitted',
+    checkInTime: new Date(new Date().setHours(7, 0, 0, 0)).toISOString(),
+  });
+
+  const result = validateCheckIn(earlyCheckIn, ptestRoute, [], undefined);
+  assert(result.valid === true, '时间窗问题应为警告而非错误');
+  assert(result.warnings.some(w => w.includes('时间不在有效时间窗')), '应提示超出时间窗警告');
+  assert(result.options.some(o => o.value === 'exception'), '应包含记为异常签到选项');
+  assert(result.options.some(o => o.value === 'draft'), '应包含保存草稿选项');
+  assert(result.options.some(o => o.value === 'cancel'), '应包含放弃提交选项');
+});
+
+test('跨门店补签：给出警告并提供异常签到选项', () => {
+  const crossStoreCheckIn = normalizeCheckInDefaults({
+    id: 'ci-cross', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreB.id, inspectorId: pinspector.id, status: 'submitted',
+  });
+
+  const result = validateCheckIn(crossStoreCheckIn, ptestRoute, [], pstoreA.id);
+  assert(result.valid === true, '跨门店应为警告而非错误');
+  assert(result.warnings.some(w => w.includes('跨门店补签')), '应提示跨门店补签警告');
+  assert(result.options.some(o => o.value === 'exception'), '应包含记为异常签到选项');
+});
+
+test('路线版本不一致：给出警告并提供异常签到选项', () => {
+  const oldVersionCheckIn = normalizeCheckInDefaults({
+    id: 'ci-old', routeId: 'route-1', routeVersion: 0,
+    checkpointId: 'cp-1', storeId: pstoreA.id, inspectorId: pinspector.id,
+    status: 'submitted',
+  });
+
+  const result = validateCheckIn(oldVersionCheckIn, ptestRoute, [], undefined);
+  assert(result.valid === true, '版本不一致应为警告而非错误');
+  assert(result.warnings.some(w => w.includes('路线版本不一致')), '应提示版本不一致警告');
+  assert(result.options.some(o => o.value === 'exception'), '应包含记为异常签到选项');
+});
+
+test('草稿可保存：不受重复签到限制', () => {
+  const existingDraft = normalizeCheckInDefaults({
+    id: 'ci-draft', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreA.id, inspectorId: pinspector.id, status: 'draft',
+  });
+
+  const newCheckIn = normalizeCheckInDefaults({
+    id: 'ci-new', routeId: 'route-1', checkpointId: 'cp-1',
+    storeId: pstoreA.id, inspectorId: pinspector.id, status: 'submitted',
+  });
+
+  const result = validateCheckIn(newCheckIn, ptestRoute, [existingDraft], undefined);
+  assert(result.valid === true, '草稿不应影响新的签到');
+  assert(result.errors.length === 0, '不应有错误');
+});
+
+test('normalizePatrolRouteDefaults：缺字段自动补齐', () => {
+  const partial = { id: 'r-1', name: '', creatorId: psupervisor.id };
+  const normalized = normalizePatrolRouteDefaults(partial);
+  assert(normalized.name === '未命名路线', '缺少名称应补默认值');
+  assert(normalized.version === 1, '缺少版本应补 1');
+  assert(normalized.status === 'active', '缺少状态应补 active');
+  assert(Array.isArray(normalized.checkpoints), '缺少检查点应补空数组');
+  assert(normalized.synced === false, '缺少 synced 应补 false');
+});
+
+test('normalizeCheckInDefaults：缺字段自动补齐', () => {
+  const partial = { id: 'ci-1', routeId: 'r-1', checkpointId: 'cp-1', storeId: pstoreA.id, inspectorId: pinspector.id };
+  const normalized = normalizeCheckInDefaults(partial);
+  assert(normalized.status === 'draft', '缺少状态应补 draft');
+  assert(normalized.routeVersion === 1, '缺少 routeVersion 应补 1');
+  assert(normalized.syncStatus === 'pending', '缺少 syncStatus 应补 pending');
+  assert(normalized.remark === '', '缺少 remark 应补空字符串');
+  assert(typeof normalized.checkInTime === 'string', '缺少 checkInTime 应补当前时间');
+});
+
+test('导入导出往返：备份数据完整保留', () => {
+  const originalRoute = normalizePatrolRouteDefaults({
+    id: 'r-round', name: '往返测试路线', version: 2,
+    checkpoints: [
+      { id: 'cp-r1', name: '入口检查', storeId: pstoreA.id, timeWindowStart: '08:00', timeWindowEnd: '20:00' },
+      { id: 'cp-r2', name: '仓库检查', storeId: pstoreA.id, timeWindowStart: '09:00', timeWindowEnd: '17:00' },
+    ],
+    creatorId: psupervisor.id,
+  });
+
+  const originalCheckIn = normalizeCheckInDefaults({
+    id: 'ci-round', routeId: 'r-round', routeVersion: 2,
+    checkpointId: 'cp-r1', storeId: pstoreA.id, inspectorId: pinspector.id,
+    status: 'exception',
+    exception: { type: 'out_of_window', description: '临时提前到店' },
+    remark: '已和店长确认',
+    syncStatus: 'completed',
+  });
+
+  const syncQueueItem = {
+    id: 'sync-1', entityType: 'check_in', entityId: 'ci-round',
+    action: 'update', status: 'completed', retryCount: 0,
+    payload: originalCheckIn,
+  };
+
+  const exported = {
+    patrolRoutes: [originalRoute],
+    checkIns: [originalCheckIn],
+    patrolSyncQueue: [syncQueueItem],
+    exportedAt: new Date().toISOString(),
+    exportedBy: { id: psupervisor.id, role: psupervisor.role, name: psupervisor.name },
+    schemaVersion: '1.0',
+  };
+
+  const validation = validatePatrolBackupImport(exported, [], psupervisor);
+  assert(validation.valid === true, '往返导入应有效');
+  assert(validation.warnings.length === 0, '完整数据不应有警告');
+  assert(validation.routesToImport.length === 1, '路线数量应一致');
+  assert(validation.checkInsToImport.length === 1, '签到数量应一致');
+
+  const importedRoute = validation.routesToImport[0];
+  assert(importedRoute.id === 'r-round', '路线 ID 保留');
+  assert(importedRoute.version === 2, '路线版本保留');
+  assert(importedRoute.checkpoints.length === 2, '检查点数量保留');
+  assert(importedRoute.checkpoints[0].timeWindowStart === '08:00', '时间窗保留');
+
+  const importedCheckIn = validation.checkInsToImport[0];
+  assert(importedCheckIn.status === 'exception', '异常状态保留');
+  assert(importedCheckIn.exception.type === 'out_of_window', '异常类型保留');
+  assert(importedCheckIn.exception.description === '临时提前到店', '异常描述保留');
+  assert(importedCheckIn.remark === '已和店长确认', '备注保留');
+  assert(importedCheckIn.syncStatus === 'completed', '同步状态保留');
+});
+
+test('旧备份缺字段：给出警告并补默认值', () => {
+  const oldBackup = {
+    schemaVersion: '1.0',
+    patrolRoutes: [
+      {
+        id: 'r-old', checkpoints: [{ id: 'cp-old', storeId: pstoreA.id }],
+        creatorId: psupervisor.id,
+      },
+    ],
+    checkIns: [
+      { id: 'ci-old', routeId: 'r-old', checkpointId: 'cp-old', storeId: pstoreA.id },
+    ],
+  };
+
+  const validation = validatePatrolBackupImport(oldBackup, [], psupervisor);
+  assert(validation.valid === true, '旧备份仍可导入');
+  assert(validation.warnings.some(w => w.type === 'patrol_missing_route_name'), '应警告缺少路线名称');
+  assert(validation.warnings.some(w => w.type === 'patrol_missing_checkpoint_name'), '应警告缺少检查点名称');
+  assert(validation.warnings.some(w => w.type === 'patrol_missing_time_window'), '应警告缺少时间窗');
+  assert(validation.warnings.some(w => w.type === 'patrol_missing_inspector'), '应警告缺少巡检员');
+
+  const importedRoute = validation.routesToImport[0];
+  assert(importedRoute.name === '未命名路线', '路线名称已补默认值');
+  assert(importedRoute.version === 1, '路线版本已补默认值');
+  assert(importedRoute.checkpoints[0].name === '未命名检查点', '检查点名称已补默认值');
+  assert(importedRoute.checkpoints[0].timeWindowStart === '00:00', '时间窗已补默认值');
+  assert(importedRoute.checkpoints[0].timeWindowEnd === '23:59', '时间窗已补默认值');
+
+  assert(validation.warnings.some(w => Array.isArray(w.missingFields)), '警告应包含缺失字段列表');
+  assert(validation.warnings.some(w => w.appliedDefaults), '警告应包含应用的默认值');
+});
+
+test('同步队列：重启后可恢复处理', () => {
+  const pendingQueue = [
+    { id: 'q1', entityType: 'patrol_route', entityId: 'r-1', action: 'create', status: 'pending', retryCount: 0 },
+    { id: 'q2', entityType: 'check_in', entityId: 'ci-1', action: 'create', status: 'failed', retryCount: 1, errorMessage: '网络错误' },
+    { id: 'q3', entityType: 'check_in', entityId: 'ci-2', action: 'update', status: 'completed', retryCount: 0 },
+  ];
+
+  const pendingItems = pendingQueue.filter(i => i.status === 'pending' || i.status === 'failed');
+  assert(pendingItems.length === 2, '重启后应识别待处理的同步项');
+  assert(pendingItems[0].id === 'q1', 'pending 项在队列中');
+  assert(pendingItems[1].id === 'q2', 'failed 项在队列中');
+  assert(pendingItems[1].retryCount === 1, '失败项保留重试次数');
+  assert(pendingItems[1].errorMessage === '网络错误', '失败项保留错误信息');
+});
+
+test('历史日志：异常签到和草稿操作可追溯', () => {
+  const histories = [
+    {
+      id: generateId(), entityId: 'route-1', action: 'patrol_route_create',
+      createdAt: new Date().toISOString(),
+      createdBy: psupervisor.id, createdByName: psupervisor.name, createdByRole: psupervisor.role,
+      remark: '创建巡检路线：日常巡店路线',
+    },
+    {
+      id: generateId(), entityId: 'ci-1', action: 'patrol_checkin_submit',
+      createdAt: new Date().toISOString(),
+      createdBy: pinspector.id, createdByName: pinspector.name, createdByRole: pinspector.role,
+      remark: '签到成功',
+      detail: { routeId: 'route-1', checkpointId: 'cp-1', routeVersion: 1 },
+    },
+    {
+      id: generateId(), entityId: 'ci-2', action: 'patrol_checkin_exception',
+      createdAt: new Date().toISOString(),
+      createdBy: pinspector.id, createdByName: pinspector.name, createdByRole: pinspector.role,
+      remark: '异常签到：超出时间窗',
+      detail: { routeId: 'route-1', checkpointId: 'cp-1', exceptionType: 'out_of_window' },
+    },
+    {
+      id: generateId(), entityId: 'ci-3', action: 'patrol_checkin_draft',
+      createdAt: new Date().toISOString(),
+      createdBy: pinspector.id, createdByName: pinspector.name, createdByRole: pinspector.role,
+      remark: '保存签到草稿',
+    },
+  ];
+
+  assert(histories[0].action === 'patrol_route_create', '路线创建动作正确');
+  assert(histories[1].detail.routeVersion === 1, '签到记录含路线版本');
+  assert(histories[2].remark.includes('异常签到'), '异常签到有明确记录');
+  assert(histories[2].detail.exceptionType === 'out_of_window', '异常类型可追溯');
+  assert(histories[3].action === 'patrol_checkin_draft', '草稿保存有记录');
+});
+
+test('多种异常组合：所有处理选项正确展示', () => {
+  const comboCheckIn = normalizeCheckInDefaults({
+    id: 'ci-combo', routeId: 'route-1', routeVersion: 0,
+    checkpointId: 'cp-1', storeId: pstoreB.id, inspectorId: pinspector.id,
+    status: 'submitted',
+    checkInTime: new Date(new Date().setHours(5, 0, 0, 0)).toISOString(),
+  });
+
+  const result = validateCheckIn(comboCheckIn, ptestRoute, [], pstoreA.id);
+  assert(result.valid === true, '多种异常组合仍为警告');
+  assert(result.warnings.length >= 3, '应有至少三个警告（时间窗、跨门店、版本）');
+
+  const uniqueOptions = [...new Set(result.options.map(o => o.value))];
+  assert(uniqueOptions.includes('exception'), '有异常签到选项');
+  assert(uniqueOptions.includes('draft'), '有保存草稿选项');
+  assert(uniqueOptions.includes('cancel'), '有放弃提交选项');
 });
 
 console.log('\n=== 结果统计 ===');

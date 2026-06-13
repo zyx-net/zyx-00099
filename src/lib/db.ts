@@ -2,12 +2,13 @@ import { openDB, IDBPDatabase } from 'idb';
 import {
   Issue, Store, Template, History, Conflict, SyncQueueItem, User, MigrationRecord,
   ReviewPlan, PlanConflict, PlanDelayRecord, HandoverImportBatch, HandoverImportPrecheckResult,
-  Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord, MaterialSyncQueueItem
+  Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord, MaterialSyncQueueItem,
+  PatrolRoute, CheckIn, PatrolSyncQueueItem
 } from '@/types';
 import { normalizeReviewPlanDefaults } from '@/utils/helpers';
 
 const DB_NAME = 'inspection-pwa-db';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 
 export interface DBSchema {
   users: { key: string; value: User };
@@ -28,6 +29,9 @@ export interface DBSchema {
   materialBorrowForms: { key: string; value: MaterialBorrowForm; indexes: { 'by-material': string; 'by-store': string; 'by-borrower': string; 'by-status': string } };
   materialRecords: { key: string; value: MaterialRecord; indexes: { 'by-material': string; 'by-store': string; 'by-form': string; 'by-operator': string; 'by-timestamp': string } };
   materialSyncQueue: { key: string; value: MaterialSyncQueueItem; indexes: { 'by-status': string; 'by-entity': string } };
+  patrolRoutes: { key: string; value: PatrolRoute; indexes: { 'by-status': string; 'by-creator': string } };
+  checkIns: { key: string; value: CheckIn; indexes: { 'by-route': string; 'by-checkpoint': string; 'by-inspector': string; 'by-store': string; 'by-sync-status': string } };
+  patrolSyncQueue: { key: string; value: PatrolSyncQueueItem; indexes: { 'by-status': string; 'by-entity': string } };
 }
 
 let db: IDBPDatabase<DBSchema> | null = null;
@@ -185,6 +189,26 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
           const msqStore = db.createObjectStore('materialSyncQueue', { keyPath: 'id' });
           msqStore.createIndex('by-status', 'status');
           msqStore.createIndex('by-entity', 'entityType');
+        }
+      }
+      if (oldVersion < 7) {
+        if (!db.objectStoreNames.contains('patrolRoutes')) {
+          const prStore = db.createObjectStore('patrolRoutes', { keyPath: 'id' });
+          prStore.createIndex('by-status', 'status');
+          prStore.createIndex('by-creator', 'creatorId');
+        }
+        if (!db.objectStoreNames.contains('checkIns')) {
+          const ciStore = db.createObjectStore('checkIns', { keyPath: 'id' });
+          ciStore.createIndex('by-route', 'routeId');
+          ciStore.createIndex('by-checkpoint', 'checkpointId');
+          ciStore.createIndex('by-inspector', 'inspectorId');
+          ciStore.createIndex('by-store', 'storeId');
+          ciStore.createIndex('by-sync-status', 'syncStatus');
+        }
+        if (!db.objectStoreNames.contains('patrolSyncQueue')) {
+          const psqStore = db.createObjectStore('patrolSyncQueue', { keyPath: 'id' });
+          psqStore.createIndex('by-status', 'status');
+          psqStore.createIndex('by-entity', 'entityType');
         }
       }
     },
@@ -469,7 +493,7 @@ export async function updatePlanDelayRecord(record: PlanDelayRecord): Promise<st
 export async function clearAllData(): Promise<void> {
   const database = await initDB();
   const tx = database.transaction(
-    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords', 'handoverImportBatches', 'handoverPrecheckResults', 'materials', 'materialBatches', 'materialBorrowForms', 'materialRecords', 'materialSyncQueue'],
+    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords', 'handoverImportBatches', 'handoverPrecheckResults', 'materials', 'materialBatches', 'materialBorrowForms', 'materialRecords', 'materialSyncQueue', 'patrolRoutes', 'checkIns', 'patrolSyncQueue'],
     'readwrite'
   );
   await Promise.all([
@@ -490,6 +514,9 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore('materialBorrowForms').clear(),
     tx.objectStore('materialRecords').clear(),
     tx.objectStore('materialSyncQueue').clear(),
+    tx.objectStore('patrolRoutes').clear(),
+    tx.objectStore('checkIns').clear(),
+    tx.objectStore('patrolSyncQueue').clear(),
     tx.done,
   ]);
 }
@@ -700,4 +727,104 @@ export async function putMaterialSyncQueueItem(item: MaterialSyncQueueItem): Pro
 export async function deleteMaterialSyncQueueItem(id: string): Promise<void> {
   const database = await initDB();
   await database.delete('materialSyncQueue', id);
+}
+
+export async function getAllPatrolRoutes(): Promise<PatrolRoute[]> {
+  const database = await initDB();
+  return database.getAll('patrolRoutes');
+}
+
+export async function getPatrolRouteById(id: string): Promise<PatrolRoute | undefined> {
+  const database = await initDB();
+  return database.get('patrolRoutes', id);
+}
+
+export async function getPatrolRoutesByStatus(status: string): Promise<PatrolRoute[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('patrolRoutes', 'by-status', status);
+}
+
+export async function addPatrolRoute(route: PatrolRoute): Promise<string> {
+  const database = await initDB();
+  return database.add('patrolRoutes', route) as Promise<string>;
+}
+
+export async function putPatrolRoute(route: PatrolRoute): Promise<string> {
+  const database = await initDB();
+  return database.put('patrolRoutes', route) as Promise<string>;
+}
+
+export async function deletePatrolRoute(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('patrolRoutes', id);
+}
+
+export async function getAllCheckIns(): Promise<CheckIn[]> {
+  const database = await initDB();
+  return database.getAll('checkIns');
+}
+
+export async function getCheckInById(id: string): Promise<CheckIn | undefined> {
+  const database = await initDB();
+  return database.get('checkIns', id);
+}
+
+export async function getCheckInsByRoute(routeId: string): Promise<CheckIn[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('checkIns', 'by-route', routeId);
+}
+
+export async function getCheckInsByCheckpoint(checkpointId: string): Promise<CheckIn[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('checkIns', 'by-checkpoint', checkpointId);
+}
+
+export async function getCheckInsByInspector(inspectorId: string): Promise<CheckIn[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('checkIns', 'by-inspector', inspectorId);
+}
+
+export async function getCheckInsByStore(storeId: string): Promise<CheckIn[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('checkIns', 'by-store', storeId);
+}
+
+export async function addCheckIn(checkIn: CheckIn): Promise<string> {
+  const database = await initDB();
+  return database.add('checkIns', checkIn) as Promise<string>;
+}
+
+export async function putCheckIn(checkIn: CheckIn): Promise<string> {
+  const database = await initDB();
+  return database.put('checkIns', checkIn) as Promise<string>;
+}
+
+export async function deleteCheckIn(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('checkIns', id);
+}
+
+export async function getAllPatrolSyncQueue(): Promise<PatrolSyncQueueItem[]> {
+  const database = await initDB();
+  return database.getAll('patrolSyncQueue');
+}
+
+export async function getPatrolSyncQueueByStatus(status: string): Promise<PatrolSyncQueueItem[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('patrolSyncQueue', 'by-status', status);
+}
+
+export async function addPatrolSyncQueueItem(item: PatrolSyncQueueItem): Promise<string> {
+  const database = await initDB();
+  return database.add('patrolSyncQueue', item) as Promise<string>;
+}
+
+export async function putPatrolSyncQueueItem(item: PatrolSyncQueueItem): Promise<string> {
+  const database = await initDB();
+  return database.put('patrolSyncQueue', item) as Promise<string>;
+}
+
+export async function deletePatrolSyncQueueItem(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('patrolSyncQueue', id);
 }

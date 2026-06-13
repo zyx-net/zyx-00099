@@ -6,6 +6,8 @@ import {
   Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord, MaterialSyncQueueItem,
   MaterialBackupWarning, MaterialBackupWarningType, MaterialImportValidationResult, MaterialExportPayload,
   SyncAction,
+  PatrolRoute, CheckIn, PatrolSyncQueueItem,
+  PatrolBackupWarning, PatrolBackupWarningType, PatrolImportValidationResult, PatrolExportPayload,
 } from '@/types';
 import { generateId } from '@/utils/helpers';
 import { buildExportPayload, generateCSVWithVersions, diffTemplateVersions } from './templateVersionService';
@@ -1334,6 +1336,284 @@ export function normalizeMaterialBackupDefaults(partial: any, type: string): any
         createdAt: p.createdAt || now,
         updatedAt: p.updatedAt || now,
         synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    default:
+      return p;
+  }
+}
+
+const mockPatrolRouteDB: Record<string, PatrolRoute> = {};
+const mockCheckInDB: Record<string, CheckIn> = {};
+
+export async function syncPatrolRouteToServer(
+  route: PatrolRoute,
+  simulateConflict = false,
+): Promise<{ success: boolean; conflict?: boolean; remoteRoute?: PatrolRoute; error?: string }> {
+  await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 400));
+  const existing = mockPatrolRouteDB[route.id];
+  if (simulateConflict || (existing && existing.version > route.version)) {
+    return {
+      success: false,
+      conflict: true,
+      remoteRoute: existing || { ...route, version: route.version + 1, name: route.name + '（远程修改）' },
+    };
+  }
+  const version = existing ? existing.version + 1 : 1;
+  mockPatrolRouteDB[route.id] = { ...route, version };
+  return { success: true };
+}
+
+export async function syncCheckInToServer(
+  checkIn: CheckIn,
+  simulateConflict = false,
+): Promise<{ success: boolean; conflict?: boolean; remoteCheckIn?: CheckIn; error?: string }> {
+  await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 400));
+  const existing = mockCheckInDB[checkIn.id];
+  if (simulateConflict || (existing && existing.status === 'submitted')) {
+    return {
+      success: false,
+      conflict: true,
+      remoteCheckIn: existing || { ...checkIn, status: 'submitted' },
+    };
+  }
+  mockCheckInDB[checkIn.id] = { ...checkIn };
+  return { success: true };
+}
+
+export function createPatrolSyncQueueItem(
+  entity: PatrolRoute | CheckIn,
+  entityType: 'patrol_route' | 'check_in',
+  action: SyncAction,
+): PatrolSyncQueueItem {
+  return {
+    id: generateId(),
+    entityType,
+    entityId: entity.id,
+    action,
+    status: 'pending',
+    retryCount: 0,
+    payload: { ...entity },
+  };
+}
+
+export function validatePatrolBackupImport(
+  payload: PatrolExportPayload,
+  existingRoutes: PatrolRoute[],
+  currentUser?: User | null,
+): PatrolImportValidationResult {
+  const warnings: PatrolBackupWarning[] = [];
+  const errors: string[] = [];
+  const routesToImport: PatrolRoute[] = [];
+  const checkInsToImport: CheckIn[] = [];
+
+  const existingIds = new Set(existingRoutes.map(r => r.id));
+
+  for (const route of payload.patrolRoutes || []) {
+    if (!route.name) {
+      warnings.push({
+        type: 'patrol_missing_route_name',
+        routeId: route.id,
+        message: `路线 ${route.id} 缺少名称，已补默认值`,
+        missingFields: ['name'],
+        appliedDefaults: { name: '未命名路线' },
+      });
+      route.name = route.name || '未命名路线';
+    }
+    if (typeof route.version !== 'number' || route.version < 1) {
+      warnings.push({
+        type: 'patrol_invalid_route_version',
+        routeId: route.id,
+        routeName: route.name,
+        message: `路线「${route.name}」版本号无效，已补默认值 1`,
+        missingFields: ['version'],
+        appliedDefaults: { version: 1 },
+      });
+      route.version = 1;
+    }
+
+    for (const cp of route.checkpoints || []) {
+      if (!cp.name) {
+        warnings.push({
+          type: 'patrol_missing_checkpoint_name',
+          routeId: route.id,
+          routeName: route.name,
+          checkpointId: cp.id,
+          message: `路线「${route.name}」检查点 ${cp.id} 缺少名称，已补默认值`,
+          missingFields: ['name'],
+          appliedDefaults: { name: '未命名检查点' },
+        });
+        cp.name = cp.name || '未命名检查点';
+      }
+      if (!cp.timeWindowStart || !cp.timeWindowEnd) {
+        warnings.push({
+          type: 'patrol_missing_time_window',
+          routeId: route.id,
+          routeName: route.name,
+          checkpointId: cp.id,
+          message: `检查点「${cp.name}」缺少时间窗，已补全天`,
+          missingFields: ['timeWindowStart', 'timeWindowEnd'],
+          appliedDefaults: { timeWindowStart: '00:00', timeWindowEnd: '23:59' },
+        });
+        cp.timeWindowStart = cp.timeWindowStart || '00:00';
+        cp.timeWindowEnd = cp.timeWindowEnd || '23:59';
+      }
+      if (cp.status !== 'active' && cp.status !== 'inactive') {
+        warnings.push({
+          type: 'patrol_unknown_checkpoint_status',
+          routeId: route.id,
+          checkpointId: cp.id,
+          message: `检查点「${cp.name}」状态未知，已补默认 active`,
+          appliedDefaults: { status: 'active' },
+        });
+        cp.status = 'active';
+      }
+    }
+
+    if (existingIds.has(route.id)) {
+      warnings.push({
+        type: 'patrol_missing_route_name',
+        routeId: route.id,
+        routeName: route.name,
+        message: `路线「${route.name}」已存在，跳过`,
+      });
+      continue;
+    }
+
+    if (currentUser && currentUser.role !== 'supervisor') {
+      route.status = 'active';
+    }
+
+    routesToImport.push(route);
+  }
+
+  const importedRouteIds = new Set(routesToImport.map(r => r.id));
+  for (const ci of payload.checkIns || []) {
+    if (!ci.inspectorId) {
+      warnings.push({
+        type: 'patrol_missing_inspector',
+        checkInId: ci.id,
+        message: `签到记录 ${ci.id} 缺少巡检员信息`,
+        missingFields: ['inspectorId'],
+      });
+    }
+    if (!importedRouteIds.has(ci.routeId) && !existingIds.has(ci.routeId)) {
+      warnings.push({
+        type: 'patrol_checkin_missing_route',
+        checkInId: ci.id,
+        routeId: ci.routeId,
+        message: `签到记录 ${ci.id} 对应路线不存在，将以草稿导入`,
+        appliedDefaults: { status: 'draft' },
+      });
+      ci.status = 'draft';
+    }
+    checkInsToImport.push(ci);
+  }
+
+  return {
+    valid: errors.length === 0,
+    warnings,
+    errors,
+    routesToImport,
+    checkInsToImport,
+  };
+}
+
+export function buildPatrolExportPayload(
+  routes: PatrolRoute[],
+  checkIns: CheckIn[],
+  syncQueue: PatrolSyncQueueItem[],
+  currentUser?: User | null,
+): PatrolExportPayload {
+  return {
+    patrolRoutes: routes,
+    checkIns,
+    patrolSyncQueue: syncQueue,
+    exportedAt: new Date().toISOString(),
+    exportedBy: currentUser ? { id: currentUser.id, role: currentUser.role, name: currentUser.name } : undefined,
+    schemaVersion: '1.0',
+  };
+}
+
+export function parsePatrolBackupPayload(raw: any): { valid: boolean; payload?: PatrolExportPayload; warnings: string[]; errors: string[] } {
+  const warnings: string[] = [];
+  const errors: string[] = [];
+
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
+    if (!parsed || typeof parsed !== 'object') {
+      errors.push('格式无效');
+      return { valid: false, warnings, errors };
+    }
+
+    const payload: PatrolExportPayload = {
+      patrolRoutes: Array.isArray(parsed.patrolRoutes) ? parsed.patrolRoutes : [],
+      checkIns: Array.isArray(parsed.checkIns) ? parsed.checkIns : [],
+      patrolSyncQueue: Array.isArray(parsed.patrolSyncQueue) ? parsed.patrolSyncQueue : [],
+      exportedAt: parsed.exportedAt || new Date().toISOString(),
+      exportedBy: parsed.exportedBy || undefined,
+      schemaVersion: parsed.schemaVersion || '1.0',
+    };
+
+    if (payload.patrolRoutes.length === 0 && payload.checkIns.length === 0) {
+      warnings.push('备份数据中无路线或签到记录');
+    }
+
+    return { valid: true, payload, warnings, errors };
+  } catch (e: any) {
+    errors.push(`解析失败: ${e.message}`);
+    return { valid: false, warnings, errors };
+  }
+}
+
+export function normalizePatrolBackupDefaults(partial: any, type: string): any {
+  const now = new Date().toISOString();
+  const p = partial || {};
+
+  switch (type) {
+    case 'patrol_route':
+      return {
+        id: p.id || generateId(),
+        name: p.name || '未命名路线',
+        version: typeof p.version === 'number' ? p.version : 1,
+        status: p.status || 'active',
+        checkpoints: Array.isArray(p.checkpoints) ? p.checkpoints.map((cp: any) => ({
+          id: cp.id || generateId(),
+          routeId: p.id || generateId(),
+          name: cp.name || '未命名检查点',
+          order: typeof cp.order === 'number' ? cp.order : 0,
+          storeId: cp.storeId || '',
+          timeWindowStart: cp.timeWindowStart || '00:00',
+          timeWindowEnd: cp.timeWindowEnd || '23:59',
+          status: cp.status || 'active',
+          createdAt: cp.createdAt || now,
+          updatedAt: cp.updatedAt || now,
+        })) : [],
+        creatorId: p.creatorId || '',
+        creatorName: p.creatorName || '',
+        creatorRole: p.creatorRole || undefined,
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
+        synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    case 'check_in':
+      return {
+        id: p.id || generateId(),
+        routeId: p.routeId || '',
+        routeVersion: typeof p.routeVersion === 'number' ? p.routeVersion : 1,
+        checkpointId: p.checkpointId || '',
+        storeId: p.storeId || '',
+        inspectorId: p.inspectorId || '',
+        inspectorName: p.inspectorName || '',
+        status: p.status || 'draft',
+        checkInTime: p.checkInTime || now,
+        exception: p.exception || undefined,
+        remark: p.remark || '',
+        syncStatus: p.syncStatus || 'pending',
+        lastSyncError: p.lastSyncError || undefined,
+        lastSyncAttempt: p.lastSyncAttempt || undefined,
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
       };
     default:
       return p;

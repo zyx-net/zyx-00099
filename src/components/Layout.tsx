@@ -1,7 +1,8 @@
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, FileText, PlusCircle, RefreshCw, History, Settings, Download,
-  Wifi, WifiOff, User, LogOut, Bell, Package, ClipboardList
+  Wifi, WifiOff, User, LogOut, Bell, Package, ClipboardList,
+  MapPin, Route, ShieldCheck, Database
 } from 'lucide-react';
 import { useAppStore } from '@/store';
 import { hasPermission, ROLE_LABELS } from '@/utils/permissions';
@@ -10,6 +11,10 @@ import { cn } from '@/lib/utils';
 const navItems = [
   { path: '/issues', label: '问题列表', icon: FileText, permission: 'issue:view_own' },
   { path: '/issues/new', label: '新建问题', icon: PlusCircle, permission: 'issue:create' },
+  { path: '/patrol/routes', label: '巡检路线', icon: Route, permission: 'patrol:route_manage' },
+  { path: '/patrol/checkin', label: '巡检签到', icon: MapPin, permission: 'patrol:checkin' },
+  { path: '/patrol/store-view', label: '门店巡检', icon: ShieldCheck, permission: 'patrol:view_store_checkin' },
+  { path: '/patrol/backup', label: '巡检备份', icon: Database, permission: 'patrol:route_manage' },
   { path: '/sync', label: '同步队列', icon: RefreshCw, permission: 'sync:view' },
   { path: '/history', label: '操作历史', icon: History, permission: 'history:view' },
   { path: '/config', label: '配置导入', icon: Settings, permission: 'config:import' },

@@ -627,3 +627,114 @@ export interface MaterialExportPayload {
   };
   schemaVersion: string;
 }
+
+export type PatrolCheckpointStatus = 'active' | 'inactive';
+
+export interface PatrolCheckpoint {
+  id: string;
+  routeId: string;
+  name: string;
+  order: number;
+  storeId: string;
+  timeWindowStart: string;
+  timeWindowEnd: string;
+  status: PatrolCheckpointStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type PatrolRouteStatus = 'active' | 'inactive';
+
+export interface PatrolRoute {
+  id: string;
+  name: string;
+  version: number;
+  status: PatrolRouteStatus;
+  checkpoints: PatrolCheckpoint[];
+  creatorId: string;
+  creatorName?: string;
+  creatorRole?: UserRole;
+  createdAt: string;
+  updatedAt: string;
+  synced: boolean;
+}
+
+export type CheckInStatus = 'draft' | 'submitted' | 'exception';
+export type CheckInSyncStatus = 'pending' | 'syncing' | 'failed' | 'completed';
+
+export interface CheckInException {
+  type: 'out_of_window' | 'cross_store' | 'version_mismatch' | 'other';
+  description: string;
+}
+
+export interface CheckIn {
+  id: string;
+  routeId: string;
+  routeVersion: number;
+  checkpointId: string;
+  storeId: string;
+  inspectorId: string;
+  inspectorName?: string;
+  status: CheckInStatus;
+  checkInTime: string;
+  exception?: CheckInException;
+  remark?: string;
+  syncStatus: CheckInSyncStatus;
+  lastSyncError?: string;
+  lastSyncAttempt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PatrolSyncQueueItem {
+  id: string;
+  entityType: 'patrol_route' | 'check_in';
+  entityId: string;
+  action: SyncAction;
+  status: SyncStatus;
+  retryCount: number;
+  lastAttempt?: string;
+  errorMessage?: string;
+  payload: any;
+}
+
+export type PatrolBackupWarningType =
+  | 'patrol_missing_route_name'
+  | 'patrol_missing_checkpoint_name'
+  | 'patrol_missing_inspector'
+  | 'patrol_missing_time_window'
+  | 'patrol_invalid_route_version'
+  | 'patrol_unknown_checkpoint_status'
+  | 'patrol_checkin_missing_route';
+
+export interface PatrolBackupWarning {
+  type: PatrolBackupWarningType;
+  routeId?: string;
+  routeName?: string;
+  checkInId?: string;
+  checkpointId?: string;
+  message: string;
+  missingFields?: string[];
+  appliedDefaults?: Record<string, any>;
+}
+
+export interface PatrolImportValidationResult {
+  valid: boolean;
+  warnings: PatrolBackupWarning[];
+  errors: string[];
+  routesToImport: PatrolRoute[];
+  checkInsToImport: CheckIn[];
+}
+
+export interface PatrolExportPayload {
+  patrolRoutes: PatrolRoute[];
+  checkIns: CheckIn[];
+  patrolSyncQueue: PatrolSyncQueueItem[];
+  exportedAt: string;
+  exportedBy?: {
+    id: string;
+    role: UserRole;
+    name: string;
+  };
+  schemaVersion: string;
+}

@@ -14,6 +14,10 @@ import ConfigImport from '@/pages/ConfigImport';
 import Export from '@/pages/Export';
 import HandoverPrecheck from '@/pages/HandoverPrecheck';
 import MaterialLedger from '@/pages/MaterialLedger';
+import RouteManagement from '@/pages/patrol/RouteManagement';
+import CheckIn from '@/pages/patrol/CheckIn';
+import StorePatrolView from '@/pages/patrol/StorePatrolView';
+import PatrolBackup from '@/pages/patrol/PatrolBackup';
 
 function ProtectedRoute({ children, permission }: { children: React.ReactNode; permission?: string }) {
   const { currentUser } = useAppStore();
@@ -127,6 +131,38 @@ function AppRoutes() {
           element={
             <ProtectedRoute permission="material:view">
               <MaterialLedger />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/patrol/routes"
+          element={
+            <ProtectedRoute permission="patrol:route_manage">
+              <RouteManagement />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/patrol/checkin"
+          element={
+            <ProtectedRoute permission="patrol:checkin">
+              <CheckIn />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/patrol/store-view"
+          element={
+            <ProtectedRoute permission="patrol:view_store_checkin">
+              <StorePatrolView />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/patrol/backup"
+          element={
+            <ProtectedRoute permission="patrol:route_manage">
+              <PatrolBackup />
             </ProtectedRoute>
           }
         />

@@ -11,9 +11,12 @@ import {
   MaterialSyncQueueItem, MaterialBorrowStatus, MaterialRecordType,
   MaterialImportValidationResult, MaterialExportPayload,
   MaterialBackupWarning,
+  PatrolRoute, PatrolCheckpoint, CheckIn, PatrolSyncQueueItem,
+  PatrolImportValidationResult, PatrolBackupWarning,
+  PatrolRouteStatus, PatrolCheckpointStatus, CheckInStatus, CheckInSyncStatus,
 } from '@/types';
 import * as db from '@/lib/db';
-import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName, generateMaterialCode, generateBorrowFormNumber, generateBatchNumber, normalizeMaterialDefaults, normalizeMaterialBorrowFormDefaults, normalizeMaterialRecordDefaults, MATERIAL_BORROW_STATUS_LABELS, MATERIAL_STATUS_LABELS } from '@/utils/helpers';
+import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName, generateMaterialCode, generateBorrowFormNumber, generateBatchNumber, normalizeMaterialDefaults, normalizeMaterialBorrowFormDefaults, normalizeMaterialRecordDefaults, MATERIAL_BORROW_STATUS_LABELS, MATERIAL_STATUS_LABELS, normalizePatrolRouteDefaults, normalizeCheckInDefaults, validateCheckIn, isWithinTimeWindow, PATROL_ROUTE_STATUS_LABELS, CHECKIN_STATUS_LABELS } from '@/utils/helpers';
 import {
   syncToServer, createConflict, createSyncQueueItem,
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields,
@@ -26,6 +29,8 @@ import {
   syncMaterialToServer, syncMaterialBorrowFormToServer, createMaterialSyncQueueItem,
   validateMaterialBackupImport, buildMaterialExportPayload, exportMaterialToJSON,
   parseMaterialBackupPayload, normalizeMaterialBackupDefaults,
+  syncPatrolRouteToServer, syncCheckInToServer, createPatrolSyncQueueItem,
+  validatePatrolBackupImport, buildPatrolExportPayload, parsePatrolBackupPayload, normalizePatrolBackupDefaults,
 } from '@/services/syncService';
 import {
   canManageIssue, canUpgradeTemplate, hasPermission,
@@ -37,6 +42,7 @@ import {
   canManageMaterial, canManageStock, canReportLoss,
   canViewMaterial, canBorrowMaterial, canReturnMaterial,
   canViewStoreOccupancy, canExportMaterial,
+  canManagePatrolRoute, canCheckInPatrol, canViewPatrolCheckIn, canExportPatrol,
 } from '@/utils/permissions';
 import {
   diffTemplateVersions,
@@ -84,9 +90,15 @@ interface AppState {
   lastMaterialImportValidation: MaterialImportValidationResult | null;
   pendingMaterialBorrowForm: MaterialBorrowForm | null;
   materialImportWarnings: MaterialBackupWarning[];
+  patrolRoutes: PatrolRoute[];
+  checkIns: CheckIn[];
+  patrolSyncQueue: PatrolSyncQueueItem[];
+  lastPatrolImportValidation: PatrolImportValidationResult | null;
+  patrolImportWarnings: PatrolBackupWarning[];
 
   init: () => Promise<void>;
   initMaterials: () => Promise<void>;
+  initPatrol: () => Promise<void>;
   setCurrentUser: (user: User | null) => void;
   setOnline: (online: boolean) => void;
   toggleOnline: () => void;
@@ -186,6 +198,21 @@ interface AppState {
   getMaterialBorrowFormsForCurrentUser: () => MaterialBorrowForm[];
   getMaterialBorrowFormsForStore: (storeId: string) => MaterialBorrowForm[];
   getMaterialOccupancyByStore: (storeId: string) => Array<{ materialId: string; materialName: string; materialCode: string; borrowedQuantity: number; storeId: string; storeName?: string }>;
+
+  createPatrolRoute: (data: { name: string; checkpoints: Array<Omit<PatrolCheckpoint, 'id' | 'routeId' | 'createdAt' | 'updatedAt'>> }) => Promise<{ success: boolean; error?: string; route?: PatrolRoute }>;
+  updatePatrolRoute: (routeId: string, updates: Partial<PatrolRoute>) => Promise<{ success: boolean; error?: string }>;
+  deletePatrolRoute: (routeId: string) => Promise<{ success: boolean; error?: string }>;
+  submitCheckIn: (data: { routeId: string; checkpointId: string; storeId: string; remark?: string }) => Promise<{ success: boolean; error?: string; warnings?: string[]; options?: Array<{ label: string; value: string }>; checkIn?: CheckIn }>;
+  saveCheckInDraft: (data: { routeId: string; checkpointId: string; storeId: string; remark?: string }) => Promise<{ success: boolean; error?: string; checkIn?: CheckIn }>;
+  markCheckInException: (checkInId: string, exceptionType: CheckIn['exception']['type'], description: string) => Promise<{ success: boolean; error?: string }>;
+  abandonCheckIn: (checkInId: string) => Promise<{ success: boolean; error?: string }>;
+  processPatrolSyncQueue: (simulateConflict?: boolean) => Promise<void>;
+  retryPatrolSyncItem: (itemId: string) => Promise<void>;
+  clearCompletedPatrolSync: () => Promise<void>;
+  importPatrolBackup: (rawData: any) => Promise<{ success: boolean; warnings: PatrolBackupWarning[]; errors: string[] }>;
+  exportPatrolBackup: () => void;
+  getCheckInsForCurrentUser: () => CheckIn[];
+  getCheckInsForStore: (storeId: string) => CheckIn[];
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -219,6 +246,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   pendingMaterialBorrowForm: null,
   currentMaterialDraft: null,
   materialImportWarnings: [],
+  patrolRoutes: [],
+  checkIns: [],
+  patrolSyncQueue: [],
+  lastPatrolImportValidation: null,
+  patrolImportWarnings: [],
 
   init: async () => {
     set({ isLoading: true });
@@ -277,6 +309,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
 
       await get().initMaterials();
+      await get().initPatrol();
 
       const handleOnline = () => {
         set({ isOnline: true });
@@ -2537,6 +2570,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  initPatrol: async () => {
+    const [patrolRoutes, checkIns, patrolSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllCheckIns(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes, checkIns, patrolSyncQueue });
+
+    if (get().isOnline) {
+      get().processPatrolSyncQueue();
+    }
+  },
+
   createMaterial: async (data) => {
     const { currentUser } = get();
     if (!currentUser) return { success: false, error: '请先选择身份' };
@@ -3808,5 +3855,445 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     return Array.from(occupancyMap.values());
+  },
+
+  createPatrolRoute: async (data) => {
+    const { currentUser } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManagePatrolRoute(currentUser)) return { success: false, error: '权限不足，仅督导可管理巡检路线' };
+
+    if (!data.name || data.name.trim() === '') return { success: false, error: '请输入路线名称' };
+
+    const now = new Date().toISOString();
+    const routeId = generateId();
+
+    const checkpoints = data.checkpoints.map((cp, idx) => ({
+      ...cp,
+      id: generateId(),
+      routeId,
+      order: cp.order ?? idx,
+      createdAt: now,
+      updatedAt: now,
+    }));
+
+    const baseRoute = {
+      id: routeId,
+      name: data.name,
+      version: 1,
+      status: 'active' as const,
+      checkpoints,
+      creatorId: currentUser.id,
+      creatorName: currentUser.name,
+      creatorRole: currentUser.role,
+      createdAt: now,
+      updatedAt: now,
+      synced: false,
+    };
+
+    const route = normalizePatrolRouteDefaults(baseRoute);
+
+    await db.addPatrolRoute(route);
+
+    const syncItem = createPatrolSyncQueueItem(route, 'patrol_route', 'create');
+    await db.addPatrolSyncQueueItem(syncItem);
+
+    const [updatedRoutes, updatedSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes: updatedRoutes, patrolSyncQueue: updatedSyncQueue });
+
+    if (get().isOnline) {
+      get().processPatrolSyncQueue();
+    }
+
+    get().addToast('success', `巡检路线「${route.name}」已创建`);
+    return { success: true, route };
+  },
+
+  updatePatrolRoute: async (routeId, updates) => {
+    const { currentUser, patrolRoutes } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManagePatrolRoute(currentUser)) return { success: false, error: '权限不足，仅督导可管理巡检路线' };
+
+    const route = patrolRoutes.find(r => r.id === routeId);
+    if (!route) return { success: false, error: '巡检路线不存在' };
+
+    const now = new Date().toISOString();
+    const updated: PatrolRoute = {
+      ...route,
+      ...updates,
+      version: route.version + 1,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await db.putPatrolRoute(updated);
+
+    const syncItem = createPatrolSyncQueueItem(updated, 'patrol_route', 'update');
+    await db.addPatrolSyncQueueItem(syncItem);
+
+    const [updatedRoutes, updatedSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes: updatedRoutes, patrolSyncQueue: updatedSyncQueue });
+
+    if (get().isOnline) {
+      get().processPatrolSyncQueue();
+    }
+
+    get().addToast('success', `巡检路线「${updated.name}」已更新`);
+    return { success: true };
+  },
+
+  deletePatrolRoute: async (routeId) => {
+    const { currentUser, patrolRoutes } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManagePatrolRoute(currentUser)) return { success: false, error: '权限不足，仅督导可管理巡检路线' };
+
+    const route = patrolRoutes.find(r => r.id === routeId);
+    if (!route) return { success: false, error: '巡检路线不存在' };
+
+    await db.deletePatrolRoute(routeId);
+
+    const [updatedRoutes, updatedSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes: updatedRoutes, patrolSyncQueue: updatedSyncQueue });
+
+    get().addToast('success', `巡检路线「${route.name}」已删除`);
+    return { success: true };
+  },
+
+  submitCheckIn: async (data) => {
+    const { currentUser, patrolRoutes, checkIns } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canCheckInPatrol(currentUser)) return { success: false, error: '权限不足，无法签到' };
+
+    const { routeId, checkpointId, storeId, remark } = data;
+    const route = patrolRoutes.find(r => r.id === routeId);
+    const now = new Date().toISOString();
+
+    const checkIn = normalizeCheckInDefaults({
+      id: generateId(),
+      routeId,
+      routeVersion: route?.version ?? 1,
+      checkpointId,
+      storeId,
+      inspectorId: currentUser.id,
+      inspectorName: currentUser.name,
+      status: 'submitted' as const,
+      checkInTime: now,
+      remark,
+      syncStatus: 'pending' as const,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const validation = validateCheckIn(checkIn, route, checkIns, currentUser.storeId);
+
+    if (!validation.valid) {
+      return {
+        success: false,
+        error: validation.errors.join('；'),
+        warnings: validation.warnings,
+        options: validation.options,
+      };
+    }
+
+    if (validation.warnings.length > 0) {
+      return {
+        success: false,
+        error: '签到存在警告，请选择处理方式',
+        warnings: validation.warnings,
+        options: validation.options,
+      };
+    }
+
+    await db.addCheckIn(checkIn);
+
+    const syncItem = createPatrolSyncQueueItem(checkIn, 'check_in', 'create');
+    await db.addPatrolSyncQueueItem(syncItem);
+
+    const [updatedCheckIns, updatedSyncQueue] = await Promise.all([
+      db.getAllCheckIns(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ checkIns: updatedCheckIns, patrolSyncQueue: updatedSyncQueue });
+
+    if (get().isOnline) {
+      get().processPatrolSyncQueue();
+    }
+
+    get().addToast('success', '签到成功');
+    return { success: true, checkIn };
+  },
+
+  saveCheckInDraft: async (data) => {
+    const { currentUser, patrolRoutes } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canCheckInPatrol(currentUser)) return { success: false, error: '权限不足，无法签到' };
+
+    const { routeId, checkpointId, storeId, remark } = data;
+    const route = patrolRoutes.find(r => r.id === routeId);
+    const now = new Date().toISOString();
+
+    const checkIn = normalizeCheckInDefaults({
+      id: generateId(),
+      routeId,
+      routeVersion: route?.version ?? 1,
+      checkpointId,
+      storeId,
+      inspectorId: currentUser.id,
+      inspectorName: currentUser.name,
+      status: 'draft' as const,
+      checkInTime: now,
+      remark,
+      syncStatus: 'pending' as const,
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    await db.addCheckIn(checkIn);
+
+    const updatedCheckIns = await db.getAllCheckIns();
+    set({ checkIns: updatedCheckIns });
+
+    get().addToast('info', '签到草稿已保存');
+    return { success: true, checkIn };
+  },
+
+  markCheckInException: async (checkInId, exceptionType, description) => {
+    const { currentUser, checkIns } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const checkIn = checkIns.find(c => c.id === checkInId);
+    if (!checkIn) return { success: false, error: '签到记录不存在' };
+
+    const now = new Date().toISOString();
+    const updated: CheckIn = {
+      ...checkIn,
+      exception: { type: exceptionType, description },
+      status: 'exception',
+      updatedAt: now,
+    };
+
+    await db.putCheckIn(updated);
+
+    const syncItem = createPatrolSyncQueueItem(updated, 'check_in', 'update');
+    await db.addPatrolSyncQueueItem(syncItem);
+
+    const [updatedCheckIns, updatedSyncQueue] = await Promise.all([
+      db.getAllCheckIns(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ checkIns: updatedCheckIns, patrolSyncQueue: updatedSyncQueue });
+
+    get().addToast('warning', '签到已标记为异常');
+    return { success: true };
+  },
+
+  abandonCheckIn: async (checkInId) => {
+    const { currentUser, checkIns } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const checkIn = checkIns.find(c => c.id === checkInId);
+    if (!checkIn) return { success: false, error: '签到记录不存在' };
+
+    await db.deleteCheckIn(checkInId);
+
+    const updatedCheckIns = await db.getAllCheckIns();
+    set({ checkIns: updatedCheckIns });
+
+    get().addToast('info', '签到已放弃');
+    return { success: true };
+  },
+
+  processPatrolSyncQueue: async (simulateConflict = false) => {
+    const { patrolSyncQueue: currentQueue, isOnline } = get();
+    if (!isOnline) {
+      get().addToast('warning', '当前离线，无法同步');
+      return;
+    }
+
+    const pendingItems = currentQueue.filter(i => i.status === 'pending' || i.status === 'failed');
+
+    for (const item of pendingItems) {
+      await db.putPatrolSyncQueueItem({ ...item, status: 'syncing', lastAttempt: new Date().toISOString() });
+      set({ patrolSyncQueue: await db.getAllPatrolSyncQueue() });
+
+      if (item.entityType === 'patrol_route' && item.payload) {
+        const result = await syncPatrolRouteToServer(item.payload, simulateConflict && Math.random() > 0.7);
+        if (result.success) {
+          await db.putPatrolRoute({ ...item.payload, synced: true });
+          await db.putPatrolSyncQueueItem({ ...item, status: 'completed' });
+        } else {
+          const errMsg = result.error || '巡检路线同步失败';
+          await db.putPatrolSyncQueueItem({
+            ...item,
+            status: 'failed',
+            retryCount: item.retryCount + 1,
+            errorMessage: errMsg,
+          });
+        }
+      } else if (item.entityType === 'check_in' && item.payload) {
+        const result = await syncCheckInToServer(item.payload, simulateConflict && Math.random() > 0.7);
+        if (result.success) {
+          await db.putCheckIn({ ...item.payload, syncStatus: 'completed' });
+          await db.putPatrolSyncQueueItem({ ...item, status: 'completed' });
+        } else {
+          const errMsg = result.error || '签到同步失败';
+          await db.putPatrolSyncQueueItem({
+            ...item,
+            status: 'failed',
+            retryCount: item.retryCount + 1,
+            errorMessage: errMsg,
+          });
+        }
+      } else {
+        await db.putPatrolSyncQueueItem({ ...item, status: 'completed' });
+      }
+    }
+
+    const [patrolRoutes, checkIns, patrolSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllCheckIns(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes, checkIns, patrolSyncQueue });
+
+    const completedCount = patrolSyncQueue.filter(i => i.status === 'completed').length;
+    const failedCount = patrolSyncQueue.filter(i => i.status === 'failed').length;
+    if (completedCount > 0) {
+      get().addToast('success', `巡检同步成功 ${completedCount} 项`);
+    }
+    if (failedCount > 0) {
+      get().addToast('error', `巡检同步失败 ${failedCount} 项`);
+    }
+  },
+
+  retryPatrolSyncItem: async (itemId) => {
+    const item = get().patrolSyncQueue.find(i => i.id === itemId);
+    if (!item) return;
+
+    await db.putPatrolSyncQueueItem({ ...item, status: 'pending', retryCount: 0 });
+    const patrolSyncQueue = await db.getAllPatrolSyncQueue();
+    set({ patrolSyncQueue });
+    get().processPatrolSyncQueue();
+  },
+
+  clearCompletedPatrolSync: async () => {
+    const { patrolSyncQueue } = get();
+    const completed = patrolSyncQueue.filter(i => i.status === 'completed');
+    for (const item of completed) {
+      await db.deletePatrolSyncQueueItem(item.id);
+    }
+    const updatedQueue = await db.getAllPatrolSyncQueue();
+    set({ patrolSyncQueue: updatedQueue });
+    get().addToast('info', `已清除 ${completed.length} 条已完成同步记录`);
+  },
+
+  importPatrolBackup: async (rawData) => {
+    const { currentUser, patrolRoutes: existingRoutes } = get();
+    if (!currentUser) return { success: false, warnings: [], errors: ['请先登录'] };
+    if (!canManagePatrolRoute(currentUser)) {
+      return { success: false, warnings: [], errors: ['权限不足，仅督导可导入巡检数据'] };
+    }
+
+    const parsed = parsePatrolBackupPayload(rawData);
+    if (!parsed.valid || !parsed.payload) {
+      for (const err of parsed.errors) get().addToast('error', err);
+      return { success: false, warnings: [], errors: parsed.errors };
+    }
+
+    const validation = validatePatrolBackupImport(parsed.payload, existingRoutes, currentUser);
+    set({ lastPatrolImportValidation: validation, patrolImportWarnings: validation.warnings });
+
+    if (!validation.valid) {
+      for (const err of validation.errors) get().addToast('error', err);
+      return { success: false, warnings: validation.warnings, errors: validation.errors };
+    }
+
+    for (const route of validation.routesToImport) {
+      try {
+        await db.addPatrolRoute(route);
+      } catch {
+        await db.putPatrolRoute(route);
+      }
+      const syncItem = createPatrolSyncQueueItem(route, 'patrol_route', 'create');
+      await db.addPatrolSyncQueueItem(syncItem);
+    }
+
+    for (const ci of validation.checkInsToImport) {
+      try {
+        await db.addCheckIn(ci);
+      } catch {
+        await db.putCheckIn(ci);
+      }
+      const syncItem = createPatrolSyncQueueItem(ci, 'check_in', 'create');
+      await db.addPatrolSyncQueueItem(syncItem);
+    }
+
+    const [patrolRoutes, checkIns, patrolSyncQueue] = await Promise.all([
+      db.getAllPatrolRoutes(),
+      db.getAllCheckIns(),
+      db.getAllPatrolSyncQueue(),
+    ]);
+
+    set({ patrolRoutes, checkIns, patrolSyncQueue });
+
+    if (get().isOnline) {
+      get().processPatrolSyncQueue();
+    }
+
+    for (const warn of validation.warnings) {
+      get().addToast('warning', warn.message);
+    }
+
+    get().addToast('success',
+      `导入完成：${validation.routesToImport.length} 条巡检路线，${validation.checkInsToImport.length} 条签到记录`
+    );
+
+    return { success: true, warnings: validation.warnings, errors: [] };
+  },
+
+  exportPatrolBackup: () => {
+    const { currentUser, patrolRoutes, checkIns, patrolSyncQueue } = get();
+    if (!currentUser) return;
+    if (!canExportPatrol(currentUser)) {
+      get().addToast('error', '权限不足，仅督导可导出巡检数据');
+      return;
+    }
+
+    const payload = buildPatrolExportPayload(patrolRoutes, checkIns, patrolSyncQueue, currentUser);
+
+    const content = JSON.stringify(payload, null, 2);
+    const timestamp = new Date().toISOString().slice(0, 10);
+    downloadFile(content, `patrol-backup-${timestamp}.json`, 'application/json');
+
+    get().addToast('success',
+      `巡检数据导出成功（${patrolRoutes.length} 条路线，${checkIns.length} 条签到记录）`
+    );
+  },
+
+  getCheckInsForCurrentUser: () => {
+    const { checkIns, currentUser } = get();
+    if (!currentUser) return [];
+    return checkIns.filter(c => c.inspectorId === currentUser.id);
+  },
+
+  getCheckInsForStore: (storeId) => {
+    const { checkIns, currentUser } = get();
+    if (!currentUser) return [];
+    if (!canViewPatrolCheckIn(currentUser)) return [];
+    return checkIns.filter(c => c.storeId === storeId);
   },
 }));

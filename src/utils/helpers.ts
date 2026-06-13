@@ -1,4 +1,4 @@
-import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus, PlanDueStatus, ReviewPlan, PlanDelayRecord, MaterialBorrowStatus, MaterialRecordType, MaterialStatus, MaterialBorrowForm, MaterialRecord, Material } from '@/types';
+import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus, PlanDueStatus, ReviewPlan, PlanDelayRecord, MaterialBorrowStatus, MaterialRecordType, MaterialStatus, MaterialBorrowForm, MaterialRecord, Material, PatrolRoute, PatrolCheckpoint, CheckIn, CheckInStatus, CheckInSyncStatus, PatrolRouteStatus, PatrolCheckpointStatus } from '@/types';
 
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -337,4 +337,153 @@ export function normalizeMaterialRecordDefaults(partial: Partial<MaterialRecord>
     remark: partial.remark || '',
     synced: partial.synced ?? false,
   };
+}
+
+export const PATROL_ROUTE_STATUS_LABELS: Record<PatrolRouteStatus, string> = {
+  active: '启用',
+  inactive: '停用',
+};
+
+export const PATROL_ROUTE_STATUS_COLORS: Record<PatrolRouteStatus, string> = {
+  active: 'bg-green-100 text-green-700',
+  inactive: 'bg-gray-100 text-gray-600',
+};
+
+export const PATROL_CHECKPOINT_STATUS_LABELS: Record<PatrolCheckpointStatus, string> = {
+  active: '启用',
+  inactive: '停用',
+};
+
+export const CHECKIN_STATUS_LABELS: Record<CheckInStatus, string> = {
+  draft: '草稿',
+  submitted: '已签到',
+  exception: '异常签到',
+};
+
+export const CHECKIN_STATUS_COLORS: Record<CheckInStatus, string> = {
+  draft: 'bg-gray-100 text-gray-600',
+  submitted: 'bg-green-100 text-green-700',
+  exception: 'bg-orange-100 text-orange-700',
+};
+
+export const CHECKIN_SYNC_STATUS_LABELS: Record<CheckInSyncStatus, string> = {
+  pending: '待同步',
+  syncing: '同步中',
+  failed: '同步失败',
+  completed: '已完成',
+};
+
+export const CHECKIN_SYNC_STATUS_COLORS: Record<CheckInSyncStatus, string> = {
+  pending: 'bg-yellow-100 text-yellow-700',
+  syncing: 'bg-blue-100 text-blue-700',
+  failed: 'bg-red-100 text-red-700',
+  completed: 'bg-green-100 text-green-700',
+};
+
+export const EXCEPTION_TYPE_LABELS: Record<CheckIn['exception']['type'], string> = {
+  out_of_window: '超出时间窗',
+  cross_store: '跨门店补签',
+  version_mismatch: '路线版本不一致',
+  other: '其他异常',
+};
+
+export function normalizePatrolRouteDefaults(partial: Partial<PatrolRoute> & { id: string; name: string; creatorId: string }): PatrolRoute {
+  return {
+    ...partial,
+    version: partial.version ?? 1,
+    status: partial.status || 'active',
+    checkpoints: partial.checkpoints || [],
+    creatorName: partial.creatorName || '',
+    creatorRole: partial.creatorRole || undefined,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+    synced: partial.synced ?? false,
+  };
+}
+
+export function normalizePatrolCheckpointDefaults(partial: Partial<PatrolCheckpoint> & { id: string; routeId: string; name: string; storeId: string }): PatrolCheckpoint {
+  return {
+    ...partial,
+    order: partial.order ?? 0,
+    timeWindowStart: partial.timeWindowStart || '00:00',
+    timeWindowEnd: partial.timeWindowEnd || '23:59',
+    status: partial.status || 'active',
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+  };
+}
+
+export function normalizeCheckInDefaults(partial: Partial<CheckIn> & { id: string; routeId: string; checkpointId: string; storeId: string; inspectorId: string }): CheckIn {
+  return {
+    ...partial,
+    routeVersion: partial.routeVersion ?? 1,
+    inspectorName: partial.inspectorName || '',
+    status: partial.status || 'draft',
+    checkInTime: partial.checkInTime || new Date().toISOString(),
+    exception: partial.exception || undefined,
+    remark: partial.remark || '',
+    syncStatus: partial.syncStatus || 'pending',
+    lastSyncError: partial.lastSyncError || undefined,
+    lastSyncAttempt: partial.lastSyncAttempt || undefined,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+  };
+}
+
+export function isWithinTimeWindow(checkInTime: string, timeWindowStart: string, timeWindowEnd: string): boolean {
+  const d = new Date(checkInTime);
+  const hh = d.getHours().toString().padStart(2, '0');
+  const mm = d.getMinutes().toString().padStart(2, '0');
+  const timeStr = `${hh}:${mm}`;
+  return timeStr >= timeWindowStart && timeStr <= timeWindowEnd;
+}
+
+export function validateCheckIn(
+  checkIn: CheckIn,
+  route: PatrolRoute | undefined,
+  existingCheckIns: CheckIn[],
+  currentUserStoreId?: string,
+): { valid: boolean; errors: string[]; warnings: string[]; options: Array<{ label: string; value: string }> } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+  const options: Array<{ label: string; value: string }> = [];
+
+  const duplicate = existingCheckIns.find(
+    c => c.checkpointId === checkIn.checkpointId
+      && c.inspectorId === checkIn.inspectorId
+      && c.status !== 'draft'
+      && c.id !== checkIn.id,
+  );
+  if (duplicate) {
+    errors.push('同一检查点不可重复签到');
+  }
+
+  if (!route) {
+    errors.push('签到路线不存在');
+  } else {
+    const checkpoint = route.checkpoints.find(cp => cp.id === checkIn.checkpointId);
+    if (!checkpoint) {
+      errors.push('检查点不在该路线上');
+    } else {
+      if (!isWithinTimeWindow(checkIn.checkInTime, checkpoint.timeWindowStart, checkpoint.timeWindowEnd)) {
+        warnings.push(`当前时间不在有效时间窗 [${checkpoint.timeWindowStart} - ${checkpoint.timeWindowEnd}] 内`);
+        options.push({ label: '记为异常签到', value: 'exception' });
+      }
+    }
+
+    if (checkIn.routeVersion !== route.version) {
+      warnings.push(`路线版本不一致（当前 v${route.version}，签到 v${checkIn.routeVersion}）`);
+      options.push({ label: '记为异常签到', value: 'exception' });
+    }
+  }
+
+  if (currentUserStoreId && checkIn.storeId !== currentUserStoreId) {
+    warnings.push('跨门店补签需补充异常说明');
+    options.push({ label: '记为异常签到', value: 'exception' });
+  }
+
+  options.push({ label: '保存草稿', value: 'draft' });
+  options.push({ label: '放弃提交', value: 'cancel' });
+
+  return { valid: errors.length === 0, errors, warnings, options };
 }
