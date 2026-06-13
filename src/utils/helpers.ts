@@ -1,4 +1,4 @@
-import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus, PlanDueStatus, ReviewPlan, PlanDelayRecord } from '@/types';
+import { IssueStatus, IssuePriority, SyncStatus, HistoryAction, UserRole, PlanSyncStatus, PlanDueStatus, ReviewPlan, PlanDelayRecord, MaterialBorrowStatus, MaterialRecordType, MaterialStatus, MaterialBorrowForm, MaterialRecord, Material } from '@/types';
 
 export function generateId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -204,4 +204,137 @@ export function getRoleName(role: UserRole): string {
     supervisor: '督导'
   };
   return labels[role];
+}
+
+export const MATERIAL_STATUS_LABELS: Record<MaterialStatus, string> = {
+  active: '启用',
+  inactive: '停用',
+  discontinued: '已淘汰'
+};
+
+export const MATERIAL_STATUS_COLORS: Record<MaterialStatus, string> = {
+  active: 'bg-green-100 text-green-700',
+  inactive: 'bg-gray-100 text-gray-600',
+  discontinued: 'bg-red-100 text-red-700'
+};
+
+export const MATERIAL_RECORD_TYPE_LABELS: Record<MaterialRecordType, string> = {
+  borrow: '借出',
+  return: '归还',
+  loss: '报损',
+  restock: '入库',
+  adjust: '库存调整'
+};
+
+export const MATERIAL_RECORD_TYPE_COLORS: Record<MaterialRecordType, string> = {
+  borrow: 'bg-orange-100 text-orange-700',
+  return: 'bg-blue-100 text-blue-700',
+  loss: 'bg-red-100 text-red-700',
+  restock: 'bg-green-100 text-green-700',
+  adjust: 'bg-purple-100 text-purple-700'
+};
+
+export const MATERIAL_BORROW_STATUS_LABELS: Record<MaterialBorrowStatus, string> = {
+  draft: '草稿',
+  pending: '待领取',
+  borrowed: '已借出',
+  returned: '已归还',
+  lost: '已报损',
+  cancelled: '已取消'
+};
+
+export const MATERIAL_BORROW_STATUS_COLORS: Record<MaterialBorrowStatus, string> = {
+  draft: 'bg-gray-100 text-gray-600',
+  pending: 'bg-yellow-100 text-yellow-700',
+  borrowed: 'bg-orange-100 text-orange-700',
+  returned: 'bg-green-100 text-green-700',
+  lost: 'bg-red-100 text-red-700',
+  cancelled: 'bg-gray-200 text-gray-500'
+};
+
+export const MATERIAL_CATEGORIES: string[] = ['测温设备', '标识用品', '办公文具', '清洁工具', '安全防护', '其他'];
+
+export const LOSS_REASONS: Array<{ value: string; label: string }> = [
+  { value: 'damage', label: '损坏' },
+  { value: 'lost', label: '遗失' },
+  { value: 'expired', label: '过期' },
+  { value: 'wear', label: '正常损耗' },
+  { value: 'other', label: '其他' },
+];
+
+export const MATERIAL_UNITS: string[] = ['个', '把', '台', '件', '本', '支', '卷', '盒', '箱', '套'];
+
+function padZero(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+function generateDatePrefix(): string {
+  const now = new Date();
+  return `${now.getFullYear()}${padZero(now.getMonth() + 1)}${padZero(now.getDate())}`;
+}
+
+function generateRandomSuffix(): string {
+  return Math.random().toString(36).substr(2, 4).toUpperCase().padStart(4, '0');
+}
+
+export function generateMaterialCode(): string {
+  return `MAT-${generateDatePrefix()}-${generateRandomSuffix()}`;
+}
+
+export function generateBorrowFormNumber(): string {
+  return `BRW-${generateDatePrefix()}-${generateRandomSuffix()}`;
+}
+
+export function generateBatchNumber(): string {
+  return `BCH-${generateDatePrefix()}-${generateRandomSuffix()}`;
+}
+
+export function normalizeMaterialDefaults(partial: Partial<Material> & { id: string; code: string; name: string; category: string; unit: string }): Material {
+  return {
+    ...partial,
+    spec: partial.spec || '',
+    description: partial.description || '',
+    status: partial.status || 'active',
+    totalStock: partial.totalStock ?? 0,
+    availableStock: partial.availableStock ?? 0,
+    minStock: partial.minStock ?? 0,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+    synced: partial.synced ?? false,
+  };
+}
+
+export function normalizeMaterialBorrowFormDefaults(partial: Partial<MaterialBorrowForm> & { id: string; formNumber: string; materialId: string; storeId: string; quantity: number; borrowerId: string; status: MaterialBorrowStatus }): MaterialBorrowForm {
+  return {
+    ...partial,
+    borrowerName: partial.borrowerName || '',
+    borrowerRole: partial.borrowerRole || undefined,
+    expectedReturnDate: partial.expectedReturnDate || undefined,
+    actualReturnDate: partial.actualReturnDate || undefined,
+    purpose: partial.purpose || '',
+    handbackCondition: partial.handbackCondition || '',
+    lossReason: partial.lossReason || '',
+    lossQuantity: partial.lossQuantity ?? 0,
+    operatorId: partial.operatorId || '',
+    operatorName: partial.operatorName || '',
+    operatorRole: partial.operatorRole || undefined,
+    createdAt: partial.createdAt || new Date().toISOString(),
+    updatedAt: partial.updatedAt || new Date().toISOString(),
+    synced: partial.synced ?? false,
+    lastSyncError: partial.lastSyncError || undefined,
+  };
+}
+
+export function normalizeMaterialRecordDefaults(partial: Partial<MaterialRecord> & { id: string; materialId: string; storeId: string; type: MaterialRecordType; quantity: number; beforeStock: number; afterStock: number; operatorId: string; timestamp: string }): MaterialRecord {
+  return {
+    ...partial,
+    formId: partial.formId || undefined,
+    operatorName: partial.operatorName || '',
+    operatorRole: partial.operatorRole || undefined,
+    relatedUserId: partial.relatedUserId || '',
+    relatedUserName: partial.relatedUserName || '',
+    batchId: partial.batchId || undefined,
+    remark: partial.remark || '',
+    synced: partial.synced ?? false,
+  };
 }

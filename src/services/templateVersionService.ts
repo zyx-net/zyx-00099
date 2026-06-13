@@ -22,8 +22,23 @@ import {
   PlanDueStatus,
   HandoverImportBatch,
   HandoverImportPrecheckResult,
+  Material,
+  MaterialStockBatch,
+  MaterialBorrowForm,
+  MaterialRecord,
+  MaterialSyncQueueItem,
+  MaterialBackupWarning,
+  MaterialImportValidationResult,
+  MaterialExportPayload,
 } from '@/types';
-import { generateId, normalizeReviewPlanDefaults, DUE_STATUS_LABELS } from '@/utils/helpers';
+import {
+  generateId,
+  normalizeReviewPlanDefaults,
+  DUE_STATUS_LABELS,
+  normalizeMaterialDefaults,
+  normalizeMaterialBorrowFormDefaults,
+  normalizeMaterialRecordDefaults,
+} from '@/utils/helpers';
 import { normalizeHandoverBatchDefaults, normalizeHandoverPrecheckResultDefaults } from './syncService';
 
 export function compareSemanticVersions(a: string, b: string): number {
@@ -470,7 +485,12 @@ export function buildExportPayload(
   unresolvedPlanConflicts: PlanConflict[] = [],
   planDelayRecords: PlanDelayRecord[] = [],
   handoverImportBatches: HandoverImportBatch[] = [],
-  handoverPrecheckResults: HandoverImportPrecheckResult[] = []
+  handoverPrecheckResults: HandoverImportPrecheckResult[] = [],
+  materials: Material[] = [],
+  materialBatches: MaterialStockBatch[] = [],
+  materialBorrowForms: MaterialBorrowForm[] = [],
+  materialRecords: MaterialRecord[] = [],
+  materialSyncQueue: MaterialSyncQueueItem[] = []
 ): ExportPayload {
   const plansByDelay = new Map<string, PlanDelayRecord[]>();
   for (const rec of planDelayRecords) {
@@ -511,12 +531,17 @@ export function buildExportPayload(
     planDelayRecords,
     handoverImportBatches,
     handoverPrecheckResults,
+    materials,
+    materialBatches,
+    materialBorrowForms,
+    materialRecords,
+    materialSyncQueue,
     exportedAt: new Date().toISOString(),
     exportedBy: currentUser
       ? { id: currentUser.id, role: currentUser.role, name: currentUser.name }
       : undefined,
-    schemaVersion: '5.0',
-  };
+    schemaVersion: '6.0',
+  } as ExportPayload;
 }
 
 export function parseExportPayload(raw: any): {
@@ -533,9 +558,9 @@ export function parseExportPayload(raw: any): {
   }
 
   const declaredVer: string = (raw.schemaVersion as string) || '1.0';
-  if (declaredVer !== '5.0') {
+  if (declaredVer !== '6.0') {
     warnings.push(
-      `📦 备份 schema 版本为 v${declaredVer}，当前支持 v5.0。已自动为缺失字段补充默认值，旧数据不会报废。`
+      `📦 备份 schema 版本为 v${declaredVer}，当前支持 v6.0。已自动为缺失字段补充默认值，旧数据不会报废。`
     );
     if (['1.0', '2.0'].includes(declaredVer)) {
       warnings.push(`  · 注意 v${declaredVer} 备份可能不包含「复查整改计划」，对应部分将为空。`);
@@ -545,6 +570,9 @@ export function parseExportPayload(raw: any): {
     }
     if (['1.0', '2.0', '3.0', '4.0'].includes(declaredVer)) {
       warnings.push(`  · 旧版本未包含「交接包导入批次/预检结果/撤销标记」等字段，已补默认值。`);
+    }
+    if (['1.0', '2.0', '3.0', '4.0', '5.0'].includes(declaredVer)) {
+      warnings.push(`  · 旧版本未包含「物资台账/库存批次/借用单/出入库记录/同步队列」等字段，物资相关数据将为空。`);
     }
   }
 
@@ -559,6 +587,11 @@ export function parseExportPayload(raw: any): {
   if (!raw.planDelayRecords) warnings.push('导入文件不包含延期申请记录，已用空数组代替。');
   if (!raw.handoverImportBatches) warnings.push('导入文件不包含交接包导入批次记录，已用空数组代替。');
   if (!raw.handoverPrecheckResults) warnings.push('导入文件不包含交接包预检记录，已用空数组代替。');
+  if (!raw.materials) warnings.push('导入文件不包含物资台账，已用空数组代替。');
+  if (!raw.materialBatches) warnings.push('导入文件不包含物资库存批次，已用空数组代替。');
+  if (!raw.materialBorrowForms) warnings.push('导入文件不包含物资借用单，已用空数组代替。');
+  if (!raw.materialRecords) warnings.push('导入文件不包含物资出入库记录，已用空数组代替。');
+  if (!raw.materialSyncQueue) warnings.push('导入文件不包含物资同步队列，已用空数组代替。');
 
   if (errors.length > 0) {
     return { valid: false, warnings, errors };
@@ -573,6 +606,12 @@ export function parseExportPayload(raw: any): {
   (payload as any).planDelayRecords = (payload as any).planDelayRecords || [];
   (payload as any).handoverImportBatches = (payload as any).handoverImportBatches || [];
   (payload as any).handoverPrecheckResults = (payload as any).handoverPrecheckResults || [];
+  (payload as any).materials = (payload as any).materials || [];
+  (payload as any).materialBatches = (payload as any).materialBatches || [];
+  (payload as any).materialBorrowForms = (payload as any).materialBorrowForms || [];
+  (payload as any).materialRecords = (payload as any).materialRecords || [];
+  (payload as any).materialSyncQueue = (payload as any).materialSyncQueue || [];
+  if (!(payload as any).schemaVersion) (payload as any).schemaVersion = '1.0';
 
   for (const issue of payload.issues) {
     if (!issue.templateVersion) {
@@ -664,6 +703,105 @@ export function parseExportPayload(raw: any): {
     if (rawPrechecks.length > 2) {
       warnings.push(`… 其余 ${rawPrechecks.length - 2} 个交接包预检记录同样已补齐默认字段。`);
     }
+  }
+
+  const rawMaterials: Material[] = (payload as any).materials || [];
+  if (rawMaterials.length > 0) {
+    const normalizedMaterials: Material[] = [];
+    for (let i = 0; i < rawMaterials.length; i++) {
+      const mat: any = rawMaterials[i];
+      const missingFields: string[] = [];
+      const requiredMaterialFields = ['id', 'code', 'name', 'category', 'unit'];
+      for (const f of requiredMaterialFields) {
+        if (!(f in mat) || mat[f] === undefined || mat[f] === null || mat[f] === '') {
+          missingFields.push(f);
+          if (i < 5) {
+            warnings.push(`物资「${mat.name || mat.code || mat.id || '未知'}」缺少 ${f} 字段，已使用默认值`);
+          }
+        }
+      }
+      if (i === 5 && missingFields.length > 0) {
+        warnings.push(`… 其余物资同样已检查缺失字段并补齐默认值。`);
+      }
+      const normalized = normalizeMaterialDefaults({
+        id: mat.id || generateId(),
+        code: mat.code || `MAT-${Date.now()}-${i}`,
+        name: mat.name || '未命名物资',
+        category: mat.category || '未分类',
+        unit: mat.unit || '件',
+        ...mat,
+      });
+      normalizedMaterials.push(normalized);
+    }
+    (payload as any).materials = normalizedMaterials;
+  }
+
+  const rawBorrowForms: MaterialBorrowForm[] = (payload as any).materialBorrowForms || [];
+  if (rawBorrowForms.length > 0) {
+    const normalizedBorrowForms: MaterialBorrowForm[] = [];
+    for (let i = 0; i < rawBorrowForms.length; i++) {
+      const form: any = rawBorrowForms[i];
+      const missingFields: string[] = [];
+      const requiredBorrowFields = ['id', 'formNumber', 'materialId', 'storeId', 'quantity', 'borrowerId', 'status'];
+      for (const f of requiredBorrowFields) {
+        if (!(f in form) || form[f] === undefined || form[f] === null) {
+          missingFields.push(f);
+          if (i < 3) {
+            warnings.push(`借用单「${form.formNumber || form.id || '未知'}」缺少 ${f} 字段，已使用默认值`);
+          }
+        }
+      }
+      if (i === 3 && missingFields.length > 0) {
+        warnings.push(`… 其余借用单同样已检查缺失字段并补齐默认值。`);
+      }
+      const normalized = normalizeMaterialBorrowFormDefaults({
+        id: form.id || generateId(),
+        formNumber: form.formNumber || `BRW-${Date.now()}-${i}`,
+        materialId: form.materialId || '',
+        storeId: form.storeId || '',
+        quantity: form.quantity ?? 0,
+        borrowerId: form.borrowerId || '',
+        status: form.status || 'borrowed',
+        ...form,
+      });
+      normalizedBorrowForms.push(normalized);
+    }
+    (payload as any).materialBorrowForms = normalizedBorrowForms;
+  }
+
+  const rawMaterialRecords: MaterialRecord[] = (payload as any).materialRecords || [];
+  if (rawMaterialRecords.length > 0) {
+    const normalizedRecords: MaterialRecord[] = [];
+    for (let i = 0; i < rawMaterialRecords.length; i++) {
+      const rec: any = rawMaterialRecords[i];
+      const missingFields: string[] = [];
+      const requiredRecordFields = ['id', 'materialId', 'storeId', 'type', 'quantity', 'beforeStock', 'afterStock', 'operatorId', 'timestamp'];
+      for (const f of requiredRecordFields) {
+        if (!(f in rec) || rec[f] === undefined || rec[f] === null) {
+          missingFields.push(f);
+          if (i < 3) {
+            warnings.push(`物资记录「${rec.id || '未知'}」缺少 ${f} 字段，已使用默认值`);
+          }
+        }
+      }
+      if (i === 3 && missingFields.length > 0) {
+        warnings.push(`… 其余物资记录同样已检查缺失字段并补齐默认值。`);
+      }
+      const normalized = normalizeMaterialRecordDefaults({
+        id: rec.id || generateId(),
+        materialId: rec.materialId || '',
+        storeId: rec.storeId || '',
+        type: rec.type || 'in',
+        quantity: rec.quantity ?? 0,
+        beforeStock: rec.beforeStock ?? 0,
+        afterStock: rec.afterStock ?? 0,
+        operatorId: rec.operatorId || '',
+        timestamp: rec.timestamp || new Date().toISOString(),
+        ...rec,
+      });
+      normalizedRecords.push(normalized);
+    }
+    (payload as any).materialRecords = normalizedRecords;
   }
 
   return { valid: true, payload, warnings, errors };

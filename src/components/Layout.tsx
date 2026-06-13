@@ -1,7 +1,7 @@
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, FileText, PlusCircle, RefreshCw, History, Settings, Download,
-  Wifi, WifiOff, User, LogOut, Bell, Package
+  Wifi, WifiOff, User, LogOut, Bell, Package, ClipboardList
 } from 'lucide-react';
 import { useAppStore } from '@/store';
 import { hasPermission, ROLE_LABELS } from '@/utils/permissions';
@@ -14,6 +14,7 @@ const navItems = [
   { path: '/history', label: '操作历史', icon: History, permission: 'history:view' },
   { path: '/config', label: '配置导入', icon: Settings, permission: 'config:import' },
   { path: '/handover-precheck', label: '交接包导入', icon: Package, permission: 'handover:precheck_view_all' },
+  { path: '/materials', label: '物资台账', icon: ClipboardList, permission: 'material:view' },
   { path: '/export', label: '数据导出', icon: Download, permission: 'export:data' },
 ];
 

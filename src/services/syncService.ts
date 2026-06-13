@@ -3,6 +3,9 @@ import {
   ReviewPlan, PlanConflict, PlanDelayRecord, PlanSyncStatus, User, History,
   HandoverPackage, HandoverValidationResult, HandoverPlanItem, HandoverConflictType,
   HandoverPrecheckGroup, HandoverImportBatch, HandoverImportPrecheckResult,
+  Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord, MaterialSyncQueueItem,
+  MaterialBackupWarning, MaterialBackupWarningType, MaterialImportValidationResult, MaterialExportPayload,
+  SyncAction,
 } from '@/types';
 import { generateId } from '@/utils/helpers';
 import { buildExportPayload, generateCSVWithVersions, diffTemplateVersions } from './templateVersionService';
@@ -10,6 +13,8 @@ import { canCreatePlan, canEditPlan } from '@/utils/permissions';
 
 const mockServerDB: Record<string, Issue> = {};
 const mockServerPlanDB: Record<string, ReviewPlan> = {};
+const mockMaterialDB: Record<string, Material> = {};
+const mockMaterialBorrowDB: Record<string, MaterialBorrowForm> = {};
 
 export interface SyncResult {
   success: boolean;
@@ -140,6 +145,56 @@ export async function syncPlanToServer(plan: ReviewPlan, simulateConflict = fals
   return { success: true };
 }
 
+export async function syncMaterialToServer(
+  material: Material,
+  simulateConflict = false
+): Promise<{ success: boolean; conflict?: boolean; remoteMaterial?: Material; error?: string }> {
+  await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 400));
+
+  const existing = mockMaterialDB[material.id];
+
+  if (simulateConflict || (existing && (existing as any).version > (material as any).version)) {
+    return {
+      success: false,
+      conflict: true,
+      remoteMaterial: existing || {
+        ...material,
+        name: material.name + '（远程修改）',
+        totalStock: material.totalStock + 10,
+        availableStock: material.availableStock + 10,
+      }
+    };
+  }
+
+  mockMaterialDB[material.id] = { ...material };
+  return { success: true };
+}
+
+export async function syncMaterialBorrowFormToServer(
+  form: MaterialBorrowForm,
+  simulateConflict = false
+): Promise<{ success: boolean; conflict?: boolean; remoteForm?: MaterialBorrowForm; error?: string }> {
+  await new Promise(resolve => setTimeout(resolve, 400 + Math.random() * 400));
+
+  const existing = mockMaterialBorrowDB[form.id];
+
+  if (simulateConflict || (existing && (existing as any).version > (form as any).version)) {
+    return {
+      success: false,
+      conflict: true,
+      remoteForm: existing || {
+        ...form,
+        status: form.status === 'borrowed' ? 'returned' : form.status,
+        actualReturnDate: new Date().toISOString(),
+        handbackCondition: '远程已归还',
+      }
+    };
+  }
+
+  mockMaterialBorrowDB[form.id] = { ...form };
+  return { success: true };
+}
+
 export function createPlanConflict(
   localPlan: ReviewPlan,
   remotePlan: ReviewPlan,
@@ -182,6 +237,22 @@ export function createPlanSyncQueueItem(
     payload: dummyIssue,
     entityType: 'review_plan',
     planPayload: { ...plan },
+  };
+}
+
+export function createMaterialSyncQueueItem(
+  entity: Material | MaterialStockBatch | MaterialBorrowForm | MaterialRecord,
+  entityType: MaterialSyncQueueItem['entityType'],
+  action: SyncAction
+): MaterialSyncQueueItem {
+  return {
+    id: generateId(),
+    entityType,
+    entityId: entity.id,
+    action,
+    status: 'pending',
+    retryCount: 0,
+    payload: { ...entity },
   };
 }
 
@@ -276,6 +347,11 @@ export function exportToJSON(
     planDelayRecords?: PlanDelayRecord[];
     handoverImportBatches?: HandoverImportBatch[];
     handoverPrecheckResults?: HandoverImportPrecheckResult[];
+    materials?: Material[];
+    materialBatches?: MaterialStockBatch[];
+    materialBorrowForms?: MaterialBorrowForm[];
+    materialRecords?: MaterialRecord[];
+    materialSyncQueue?: MaterialSyncQueueItem[];
     exportedAt?: string;
     exportedBy?: { id: string; role: any; name: string };
   }
@@ -292,6 +368,11 @@ export function exportToJSON(
     data.planDelayRecords || [],
     data.handoverImportBatches || [],
     data.handoverPrecheckResults || [],
+    data.materials || [],
+    data.materialBatches || [],
+    data.materialBorrowForms || [],
+    data.materialRecords || [],
+    data.materialSyncQueue || [],
   );
   return JSON.stringify(payload, null, 2);
 }
@@ -793,4 +874,468 @@ export function normalizeHandoverBatchDefaults(
     hasUndo: p.hasUndo || false,
     schemaVersion: p.schemaVersion || '2.0',
   };
+}
+
+export function validateMaterialBackupImport(
+  rawData: any,
+  existingMaterials: Material[],
+  currentUser: User | null
+): MaterialImportValidationResult {
+  const warnings: MaterialBackupWarning[] = [];
+  const errors: string[] = [];
+  const materialsToImport: Material[] = [];
+  const batchesToImport: MaterialStockBatch[] = [];
+  const borrowFormsToImport: MaterialBorrowForm[] = [];
+  const recordsToImport: MaterialRecord[] = [];
+
+  if (!rawData || typeof rawData !== 'object') {
+    return {
+      valid: false,
+      warnings,
+      errors: ['导入文件不是有效的 JSON 对象'],
+      materialsToImport: [],
+      batchesToImport: [],
+      borrowFormsToImport: [],
+      recordsToImport: [],
+    };
+  }
+
+  const rawMaterials: Material[] = Array.isArray(rawData.materials) ? rawData.materials : [];
+  const rawBatches: MaterialStockBatch[] = Array.isArray(rawData.materialBatches) ? rawData.materialBatches : [];
+  const rawBorrowForms: MaterialBorrowForm[] = Array.isArray(rawData.materialBorrowForms) ? rawData.materialBorrowForms : [];
+  const rawRecords: MaterialRecord[] = Array.isArray(rawData.materialRecords) ? rawData.materialRecords : [];
+
+  if (rawMaterials.length === 0 && rawBatches.length === 0 && rawBorrowForms.length === 0 && rawRecords.length === 0) {
+    warnings.push({
+      type: 'material_missing_abnormal',
+      message: '导入文件中未检测到任何物资相关数据。',
+    });
+  }
+
+  const existingMaterialCodeSet = new Set(existingMaterials.map(m => m.code));
+  const now = new Date().toISOString();
+
+  for (let i = 0; i < rawMaterials.length; i++) {
+    const mat: any = { ...rawMaterials[i] };
+    const missingFields: string[] = [];
+    const appliedDefaults: Record<string, any> = {};
+
+    if (!mat.code || mat.code.toString().trim() === '') {
+      missingFields.push('code');
+      const defaultCode = `IMP-${Date.now()}-${i}`;
+      mat.code = defaultCode;
+      appliedDefaults.code = defaultCode;
+    }
+
+    if (!mat.storeId || mat.storeId.toString().trim() === '') {
+      missingFields.push('storeId');
+    }
+
+    if (!mat.operatorId || mat.operatorId.toString().trim() === '') {
+      missingFields.push('operatorId');
+      if (currentUser) {
+        mat.operatorId = currentUser.id;
+        appliedDefaults.operatorId = currentUser.id;
+      }
+    }
+
+    if (typeof mat.totalStock !== 'number' || isNaN(mat.totalStock)) {
+      missingFields.push('totalStock');
+      mat.totalStock = 0;
+      appliedDefaults.totalStock = 0;
+    }
+
+    if (typeof mat.availableStock !== 'number' || isNaN(mat.availableStock)) {
+      missingFields.push('availableStock');
+      mat.availableStock = 0;
+      appliedDefaults.availableStock = 0;
+    }
+
+    if (mat.abnormalRecord && mat.abnormalRecord.toString().trim() !== '') {
+      warnings.push({
+        type: 'material_missing_abnormal',
+        materialId: mat.id,
+        materialCode: mat.code,
+        materialName: mat.name,
+        message: `物资「${mat.name || mat.code || mat.id || '未知'}」存在异常记录：${mat.abnormalRecord}，请注意复核。`,
+      });
+    }
+
+    if (missingFields.length > 0) {
+      warnings.push({
+        type: missingFields.includes('code') ? 'material_missing_code' : missingFields.includes('storeId') ? 'material_missing_store' : missingFields.includes('operatorId') ? 'material_missing_operator' : 'material_invalid_quantity',
+        materialId: mat.id,
+        materialCode: mat.code,
+        materialName: mat.name,
+        message: `物资「${mat.name || mat.code || mat.id || '未知'}」缺少字段：${missingFields.join('、')}，${Object.keys(appliedDefaults).length > 0 ? '已应用默认值：' + Object.entries(appliedDefaults).map(([k, v]) => `${k}=${v}`).join('、') : '请手动补全。'}`,
+        missingFields,
+        appliedDefaults,
+      });
+    }
+
+    if (!mat.id) mat.id = generateId();
+    if (!mat.name) {
+      mat.name = '未命名物资';
+      appliedDefaults.name = mat.name;
+    }
+    if (!mat.category) {
+      mat.category = '未分类';
+      appliedDefaults.category = mat.category;
+    }
+    if (!mat.unit) {
+      mat.unit = '件';
+      appliedDefaults.unit = mat.unit;
+    }
+    if (!mat.status) {
+      mat.status = 'active';
+      appliedDefaults.status = mat.status;
+    }
+    if (!mat.createdAt) mat.createdAt = now;
+    if (!mat.updatedAt) mat.updatedAt = now;
+    if (typeof mat.synced !== 'boolean') {
+      mat.synced = false;
+      appliedDefaults.synced = false;
+    }
+
+    if (existingMaterialCodeSet.has(mat.code)) {
+      warnings.push({
+        type: 'material_unknown_category',
+        materialId: mat.id,
+        materialCode: mat.code,
+        materialName: mat.name,
+        message: `物资编号 ${mat.code} 已存在，导入时将跳过或需要合并处理。`,
+      });
+    }
+
+    materialsToImport.push(mat as Material);
+  }
+
+  for (let i = 0; i < rawBatches.length; i++) {
+    const batch: any = { ...rawBatches[i] };
+    const missingFields: string[] = [];
+    const appliedDefaults: Record<string, any> = {};
+
+    if (!batch.id) batch.id = generateId();
+    if (!batch.materialId) {
+      missingFields.push('materialId');
+    }
+    if (!batch.storeId) {
+      missingFields.push('storeId');
+    }
+    if (!batch.batchNumber || batch.batchNumber.toString().trim() === '') {
+      missingFields.push('batchNumber');
+      batch.batchNumber = `BATCH-${Date.now()}-${i}`;
+      appliedDefaults.batchNumber = batch.batchNumber;
+    }
+    if (typeof batch.quantity !== 'number' || isNaN(batch.quantity)) {
+      batch.quantity = 0;
+      appliedDefaults.quantity = 0;
+    }
+    if (!batch.receivedDate) batch.receivedDate = now;
+    if (typeof batch.synced !== 'boolean') batch.synced = false;
+
+    if (missingFields.length > 0) {
+      warnings.push({
+        type: missingFields.includes('batchNumber') ? 'material_missing_batch' : 'material_missing_code',
+        message: `库存批次「${batch.batchNumber || batch.id || '未知'}」缺少字段：${missingFields.join('、')}，${Object.keys(appliedDefaults).length > 0 ? '已应用默认值：' + Object.entries(appliedDefaults).map(([k, v]) => `${k}=${v}`).join('、') : '请手动补全。'}`,
+        missingFields,
+        appliedDefaults,
+      });
+    }
+
+    batchesToImport.push(batch as MaterialStockBatch);
+  }
+
+  for (let i = 0; i < rawBorrowForms.length; i++) {
+    const form: any = { ...rawBorrowForms[i] };
+    const missingFields: string[] = [];
+    const appliedDefaults: Record<string, any> = {};
+
+    if (!form.id) form.id = generateId();
+    if (!form.formNumber) {
+      form.formNumber = `BRW-${Date.now()}-${i}`;
+      appliedDefaults.formNumber = form.formNumber;
+    }
+    if (!form.materialId) {
+      missingFields.push('materialId');
+    }
+    if (!form.storeId) {
+      missingFields.push('storeId');
+    }
+    if (!form.borrowerId) {
+      missingFields.push('borrowerId');
+    }
+    if (typeof form.quantity !== 'number' || isNaN(form.quantity)) {
+      form.quantity = 0;
+      appliedDefaults.quantity = 0;
+    }
+    if (!form.status) {
+      form.status = 'borrowed';
+      appliedDefaults.status = form.status;
+    }
+    if (!form.createdAt) form.createdAt = now;
+    if (!form.updatedAt) form.updatedAt = now;
+    if (typeof form.synced !== 'boolean') form.synced = false;
+
+    if (missingFields.length > 0) {
+      warnings.push({
+        type: missingFields.includes('borrowerId') ? 'material_missing_operator' : 'material_missing_code',
+        formId: form.id,
+        message: `借用单「${form.formNumber || form.id || '未知'}」缺少字段：${missingFields.join('、')}，${Object.keys(appliedDefaults).length > 0 ? '已应用默认值：' + Object.entries(appliedDefaults).map(([k, v]) => `${k}=${v}`).join('、') : '请手动补全。'}`,
+        missingFields,
+        appliedDefaults,
+      });
+    }
+
+    borrowFormsToImport.push(form as MaterialBorrowForm);
+  }
+
+  for (let i = 0; i < rawRecords.length; i++) {
+    const rec: any = { ...rawRecords[i] };
+    const missingFields: string[] = [];
+    const appliedDefaults: Record<string, any> = {};
+
+    if (!rec.id) rec.id = generateId();
+    if (!rec.materialId) {
+      missingFields.push('materialId');
+    }
+    if (!rec.storeId) {
+      missingFields.push('storeId');
+    }
+    if (!rec.operatorId) {
+      missingFields.push('operatorId');
+      if (currentUser) {
+        rec.operatorId = currentUser.id;
+        appliedDefaults.operatorId = currentUser.id;
+      }
+    }
+    if (!rec.type) {
+      rec.type = 'in';
+      appliedDefaults.type = rec.type;
+    }
+    if (typeof rec.quantity !== 'number' || isNaN(rec.quantity)) {
+      rec.quantity = 0;
+      appliedDefaults.quantity = 0;
+    }
+    if (typeof rec.beforeStock !== 'number' || isNaN(rec.beforeStock)) {
+      rec.beforeStock = 0;
+      appliedDefaults.beforeStock = 0;
+    }
+    if (typeof rec.afterStock !== 'number' || isNaN(rec.afterStock)) {
+      rec.afterStock = 0;
+      appliedDefaults.afterStock = 0;
+    }
+    if (!rec.timestamp) rec.timestamp = now;
+    if (typeof rec.synced !== 'boolean') rec.synced = false;
+
+    if (missingFields.length > 0) {
+      warnings.push({
+        type: missingFields.includes('operatorId') ? 'material_missing_operator' : 'material_missing_code',
+        message: `物资记录「${rec.id || '未知'}」缺少字段：${missingFields.join('、')}，${Object.keys(appliedDefaults).length > 0 ? '已应用默认值：' + Object.entries(appliedDefaults).map(([k, v]) => `${k}=${v}`).join('、') : '请手动补全。'}`,
+        missingFields,
+        appliedDefaults,
+      });
+    }
+
+    recordsToImport.push(rec as MaterialRecord);
+  }
+
+  return {
+    valid: errors.length === 0,
+    warnings,
+    errors,
+    materialsToImport,
+    batchesToImport,
+    borrowFormsToImport,
+    recordsToImport,
+  };
+}
+
+export function exportMaterialToJSON(
+  data: {
+    materials: Material[];
+    materialBatches: MaterialStockBatch[];
+    materialBorrowForms: MaterialBorrowForm[];
+    materialRecords: MaterialRecord[];
+    materialSyncQueue: MaterialSyncQueueItem[];
+    exportedBy?: User;
+  }
+): string {
+  const payload = buildMaterialExportPayload(
+    data.materials,
+    data.materialBatches,
+    data.materialBorrowForms,
+    data.materialRecords,
+    data.materialSyncQueue,
+    data.exportedBy,
+  );
+  return JSON.stringify(payload, null, 2);
+}
+
+export function buildMaterialExportPayload(
+  materials: Material[],
+  batches: MaterialStockBatch[],
+  borrowForms: MaterialBorrowForm[],
+  records: MaterialRecord[],
+  syncQueue: MaterialSyncQueueItem[],
+  exportedBy?: User
+): MaterialExportPayload {
+  return {
+    materials,
+    materialBatches: batches,
+    materialBorrowForms: borrowForms,
+    materialRecords: records,
+    materialSyncQueue: syncQueue,
+    exportedAt: new Date().toISOString(),
+    exportedBy: exportedBy
+      ? { id: exportedBy.id, role: exportedBy.role, name: exportedBy.name }
+      : undefined,
+    schemaVersion: '1.0',
+  };
+}
+
+export function parseMaterialBackupPayload(
+  raw: any
+): { valid: boolean; payload?: MaterialExportPayload; warnings: MaterialBackupWarning[]; errors: string[] } {
+  const warnings: MaterialBackupWarning[] = [];
+  const errors: string[] = [];
+
+  if (!raw || typeof raw !== 'object') {
+    return {
+      valid: false,
+      warnings,
+      errors: ['备份数据不是有效的 JSON 对象'],
+    };
+  }
+
+  const currentVersion = '1.0';
+  const declaredVersion: string = raw.schemaVersion || '';
+
+  if (!declaredVersion) {
+    warnings.push({
+      type: 'material_missing_abnormal',
+      message: `备份文件未指定 schemaVersion，当前支持版本 v${currentVersion}，已启用兼容模式。`,
+    });
+  } else if (declaredVersion !== currentVersion) {
+    warnings.push({
+      type: 'material_missing_abnormal',
+      message: `备份 schema 版本为 v${declaredVersion}，当前支持版本 v${currentVersion}，已启用兼容模式。`,
+    });
+  }
+
+  const payload: any = {
+    schemaVersion: currentVersion,
+    exportedAt: raw.exportedAt || new Date().toISOString(),
+    exportedBy: raw.exportedBy || undefined,
+  };
+
+  const requiredArrays = [
+    { key: 'materials', label: '物资台账' },
+    { key: 'materialBatches', label: '库存批次' },
+    { key: 'materialBorrowForms', label: '借用单' },
+    { key: 'materialRecords', label: '出入库记录' },
+  ];
+
+  for (const { key, label } of requiredArrays) {
+    if (!Array.isArray(raw[key])) {
+      warnings.push({
+        type: 'material_missing_abnormal',
+        message: `备份文件缺少 ${label} 数组（${key}），已使用空数组代替。`,
+      });
+      (payload as any)[key] = [];
+    } else {
+      (payload as any)[key] = raw[key];
+    }
+  }
+
+  if (!Array.isArray(raw.materialSyncQueue)) {
+    payload.materialSyncQueue = [];
+  } else {
+    payload.materialSyncQueue = raw.materialSyncQueue;
+  }
+
+  return {
+    valid: errors.length === 0,
+    payload: payload as MaterialExportPayload,
+    warnings,
+    errors,
+  };
+}
+
+export function normalizeMaterialBackupDefaults(partial: any, type: string): any {
+  const now = new Date().toISOString();
+  const p = partial || {};
+
+  switch (type) {
+    case 'material':
+      return {
+        id: p.id || generateId(),
+        code: p.code || '',
+        name: p.name || '未命名物资',
+        category: p.category || '未分类',
+        unit: p.unit || '件',
+        storeId: p.storeId || '',
+        operatorId: p.operatorId || '',
+        totalStock: typeof p.totalStock === 'number' ? p.totalStock : 0,
+        availableStock: typeof p.availableStock === 'number' ? p.availableStock : 0,
+        status: p.status || 'active',
+        abnormalRecord: p.abnormalRecord || '',
+        remark: p.remark || '',
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
+        synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    case 'material_batch':
+      return {
+        id: p.id || generateId(),
+        materialId: p.materialId || '',
+        storeId: p.storeId || '',
+        batchNumber: p.batchNumber || '',
+        quantity: typeof p.quantity === 'number' ? p.quantity : 0,
+        receivedDate: p.receivedDate || now,
+        remark: p.remark || '',
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
+        synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    case 'material_borrow_form':
+      return {
+        id: p.id || generateId(),
+        formNumber: p.formNumber || '',
+        materialId: p.materialId || '',
+        storeId: p.storeId || '',
+        borrowerId: p.borrowerId || '',
+        borrowerName: p.borrowerName || '',
+        quantity: typeof p.quantity === 'number' ? p.quantity : 0,
+        borrowDate: p.borrowDate || now,
+        expectedReturnDate: p.expectedReturnDate || '',
+        actualReturnDate: p.actualReturnDate || '',
+        status: p.status || 'borrowed',
+        purpose: p.purpose || '',
+        handbackCondition: p.handbackCondition || '',
+        remark: p.remark || '',
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
+        synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    case 'material_record':
+      return {
+        id: p.id || generateId(),
+        materialId: p.materialId || '',
+        storeId: p.storeId || '',
+        operatorId: p.operatorId || '',
+        type: p.type || 'in',
+        quantity: typeof p.quantity === 'number' ? p.quantity : 0,
+        beforeStock: typeof p.beforeStock === 'number' ? p.beforeStock : 0,
+        afterStock: typeof p.afterStock === 'number' ? p.afterStock : 0,
+        batchNumber: p.batchNumber || '',
+        timestamp: p.timestamp || now,
+        remark: p.remark || '',
+        createdAt: p.createdAt || now,
+        updatedAt: p.updatedAt || now,
+        synced: typeof p.synced === 'boolean' ? p.synced : false,
+      };
+    default:
+      return p;
+  }
 }

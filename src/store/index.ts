@@ -7,9 +7,13 @@ import {
   SyncEntityType, HandoverValidationResult, HandoverPackage,
   PlanDelayRecord, PlanDueStatus, HandoverImportBatch, HandoverImportPrecheckResult,
   HandoverPrecheckGroup, HandoverPlanItem,
+  Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord,
+  MaterialSyncQueueItem, MaterialBorrowStatus, MaterialRecordType,
+  MaterialImportValidationResult, MaterialExportPayload,
+  MaterialBackupWarning,
 } from '@/types';
 import * as db from '@/lib/db';
-import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName } from '@/utils/helpers';
+import { generateId, computePlanDueStatus, normalizeReviewPlanDefaults, buildDelayHistoryRemark, getPlanLastDelayReason, getPlanLastApproverName, generateMaterialCode, generateBorrowFormNumber, generateBatchNumber, normalizeMaterialDefaults, normalizeMaterialBorrowFormDefaults, normalizeMaterialRecordDefaults, MATERIAL_BORROW_STATUS_LABELS, MATERIAL_STATUS_LABELS } from '@/utils/helpers';
 import {
   syncToServer, createConflict, createSyncQueueItem,
   exportToJSON, exportToCSV, downloadFile, validateRequiredFields,
@@ -19,6 +23,9 @@ import {
   applyHandoverResolution, isHandoverPackage,
   groupHandoverPlansForPrecheck, precheckHandoverImport,
   normalizeHandoverPrecheckResultDefaults, normalizeHandoverBatchDefaults,
+  syncMaterialToServer, syncMaterialBorrowFormToServer, createMaterialSyncQueueItem,
+  validateMaterialBackupImport, buildMaterialExportPayload, exportMaterialToJSON,
+  parseMaterialBackupPayload, normalizeMaterialBackupDefaults,
 } from '@/services/syncService';
 import {
   canManageIssue, canUpgradeTemplate, hasPermission,
@@ -27,6 +34,9 @@ import {
   canRequestDelay, canApproveDelay, canDirectlyChangeReviewTime, canResolveTimeConflict,
   canViewHandoverPrecheck, canConfirmHandoverImport, canUndoHandoverImport, canSelectHandoverStrategy,
   canPrecheckHandoverImport,
+  canManageMaterial, canManageStock, canReportLoss,
+  canViewMaterial, canBorrowMaterial, canReturnMaterial,
+  canViewStoreOccupancy, canExportMaterial,
 } from '@/utils/permissions';
 import {
   diffTemplateVersions,
@@ -66,8 +76,17 @@ interface AppState {
   pendingUpgrades: PendingTemplateUpgrade[];
   lastImportValidation: ImportValidationResult | null;
   lastHandoverValidation: HandoverValidationResult | null;
+  materials: Material[];
+  materialBatches: MaterialStockBatch[];
+  materialBorrowForms: MaterialBorrowForm[];
+  materialRecords: MaterialRecord[];
+  materialSyncQueue: MaterialSyncQueueItem[];
+  lastMaterialImportValidation: MaterialImportValidationResult | null;
+  pendingMaterialBorrowForm: MaterialBorrowForm | null;
+  materialImportWarnings: MaterialBackupWarning[];
 
   init: () => Promise<void>;
+  initMaterials: () => Promise<void>;
   setCurrentUser: (user: User | null) => void;
   setOnline: (online: boolean) => void;
   toggleOnline: () => void;
@@ -141,6 +160,32 @@ interface AppState {
   exportData: (format: 'json' | 'csv') => void;
 
   getTemplateForIssue: (issue: Issue) => Template | undefined;
+
+  createMaterial: (data: Omit<Material, 'id' | 'code' | 'totalStock' | 'availableStock' | 'createdAt' | 'updatedAt' | 'synced' | 'status'> & { code?: string; initialStock?: number; storeId?: string; batchNumber?: string; status?: Material['status'] }) => Promise<{ success: boolean; error?: string; material?: Material }>;
+  updateMaterial: (id: string, updates: Partial<Material>) => Promise<{ success: boolean; error?: string }>;
+  deleteMaterial: (id: string) => Promise<{ success: boolean; error?: string }>;
+  addStockBatch: (data: { materialId: string; storeId: string; quantity: number; batchNumber?: string; remark?: string; receivedDate?: string }) => Promise<{ success: boolean; error?: string }>;
+  adjustStock: (materialId: string, storeId: string, quantity: number, reason: string) => Promise<{ success: boolean; error?: string }>;
+  createBorrowForm: (data: Omit<MaterialBorrowForm, 'id' | 'formNumber' | 'status' | 'createdAt' | 'updatedAt' | 'synced' | 'operatorId' | 'operatorName' | 'operatorRole'> & { status?: MaterialBorrowStatus }) => Promise<{ success: boolean; error?: string; form?: MaterialBorrowForm; conflicts?: Array<{ type: string; message: string; options: string[] }> }>;
+  updateBorrowForm: (formId: string, updates: Partial<MaterialBorrowForm>) => Promise<{ success: boolean; error?: string }>;
+  cancelBorrowForm: (formId: string) => Promise<{ success: boolean; error?: string }>;
+  submitBorrowForm: (formId: string) => Promise<{ success: boolean; error?: string; conflicts?: Array<{ type: string; message: string; options: string[] }> }>;
+  returnBorrowForm: (formId: string, dataOrHandbackCondition?: any, lossQuantity?: number, lossReason?: string) => Promise<{ success: boolean; error?: string; conflicts?: Array<{ type: string; message: string; options: string[] }> }>;
+  reportLoss: (materialId: string, storeId: string, quantity: number, reason: string, operatorRemark?: string) => Promise<{ success: boolean; error?: string }>;
+  validateBorrowConflicts: (materialId: string, storeId: string, borrowerId: string, quantity: number) => Array<{ type: string; message: string; options: string[] }>;
+  processMaterialSyncQueue: (simulateConflict?: boolean) => Promise<void>;
+  retryMaterialSyncItem: (itemId: string) => Promise<void>;
+  clearCompletedMaterialSync: () => Promise<void>;
+  saveDraftBorrowForm: (form: Partial<MaterialBorrowForm>) => void;
+  clearDraftBorrowForm: () => void;
+  currentMaterialDraft: MaterialBorrowForm | null;
+  saveMaterialDraft: (form: Partial<MaterialBorrowForm>) => void;
+  clearMaterialDraft: () => void;
+  importMaterialBackup: (rawData: any) => Promise<{ success: boolean; warnings: MaterialBackupWarning[]; errors: string[] }>;
+  exportMaterialBackup: () => void;
+  getMaterialBorrowFormsForCurrentUser: () => MaterialBorrowForm[];
+  getMaterialBorrowFormsForStore: (storeId: string) => MaterialBorrowForm[];
+  getMaterialOccupancyByStore: (storeId: string) => Array<{ materialId: string; materialName: string; materialCode: string; borrowedQuantity: number; storeId: string; storeName?: string }>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -165,6 +210,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   pendingUpgrades: [],
   lastImportValidation: null,
   lastHandoverValidation: null,
+  materials: [],
+  materialBatches: [],
+  materialBorrowForms: [],
+  materialRecords: [],
+  materialSyncQueue: [],
+  lastMaterialImportValidation: null,
+  pendingMaterialBorrowForm: null,
+  currentMaterialDraft: null,
+  materialImportWarnings: [],
 
   init: async () => {
     set({ isLoading: true });
@@ -221,6 +275,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         latestHandoverBatchId: latestBatch?.id || null,
         isLoading: false
       });
+
+      await get().initMaterials();
 
       const handleOnline = () => {
         set({ isOnline: true });
@@ -2455,5 +2511,1302 @@ export const useAppStore = create<AppState>((set, get) => ({
     return templates.find(
       t => t.id === issue.templateId && t.version === issue.templateVersion
     ) || templates.find(t => t.id === issue.templateId);
+  },
+
+  initMaterials: async () => {
+    const [
+      materials, materialBatches, materialBorrowForms, materialRecords, materialSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialBatches(),
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials,
+      materialBatches,
+      materialBorrowForms,
+      materialRecords,
+      materialSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+  },
+
+  createMaterial: async (data) => {
+    const { currentUser } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManageMaterial(currentUser)) return { success: false, error: '权限不足，仅督导可管理物资' };
+
+    if (!data.name || data.name.trim() === '') return { success: false, error: '请输入物资名称' };
+    if (!data.category || data.category.trim() === '') return { success: false, error: '请选择物资分类' };
+    if (!data.unit || data.unit.trim() === '') return { success: false, error: '请输入计量单位' };
+
+    const now = new Date().toISOString();
+    const code = data.code || generateMaterialCode();
+    const initialStock = data.initialStock ?? 0;
+
+    const baseMaterial = {
+      ...data,
+      id: generateId(),
+      code,
+      totalStock: initialStock,
+      availableStock: initialStock,
+      createdAt: now,
+      updatedAt: now,
+      synced: false,
+    };
+
+    const material = normalizeMaterialDefaults(baseMaterial as any);
+
+    await db.addMaterial(material);
+
+    if (initialStock > 0 && data.storeId) {
+      const batchNumber = data.batchNumber || generateBatchNumber();
+      const batch: MaterialStockBatch = {
+        id: generateId(),
+        materialId: material.id,
+        storeId: data.storeId,
+        batchNumber,
+        quantity: initialStock,
+        receivedDate: now,
+        remark: '初始库存',
+        createdAt: now,
+        synced: false,
+      };
+      await db.addMaterialBatch(batch);
+
+      const record: MaterialRecord = {
+        id: generateId(),
+        materialId: material.id,
+        storeId: data.storeId,
+        type: 'restock',
+        quantity: initialStock,
+        beforeStock: 0,
+        afterStock: initialStock,
+        operatorId: currentUser.id,
+        operatorName: currentUser.name,
+        operatorRole: currentUser.role,
+        remark: '初始库存入库',
+        timestamp: now,
+        synced: false,
+      };
+      await db.addMaterialRecord(record);
+
+      const syncItems = [
+        createMaterialSyncQueueItem(material, 'material', 'create'),
+        createMaterialSyncQueueItem(batch, 'material_batch', 'create'),
+        createMaterialSyncQueueItem(record, 'material_record', 'create'),
+      ];
+      for (const item of syncItems) {
+        await db.addMaterialSyncQueueItem(item);
+      }
+    } else {
+      const syncItem = createMaterialSyncQueueItem(material, 'material', 'create');
+      await db.addMaterialSyncQueueItem(syncItem);
+    }
+
+    const [
+      updatedMaterials, updatedBatches, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialBatches(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialBatches: updatedBatches,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `物资「${material.name}」已创建`);
+    return { success: true, material };
+  },
+
+  updateMaterial: async (id, updates) => {
+    const { currentUser, materials } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManageMaterial(currentUser)) return { success: false, error: '权限不足，仅督导可管理物资' };
+
+    const material = materials.find(m => m.id === id);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    const now = new Date().toISOString();
+    const updated: Material = {
+      ...material,
+      ...updates,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await db.putMaterial(updated);
+
+    const syncItem = createMaterialSyncQueueItem(updated, 'material', 'update');
+    await db.addMaterialSyncQueueItem(syncItem);
+
+    const [updatedMaterials, updatedSyncQueue] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `物资「${updated.name}」已更新`);
+    return { success: true };
+  },
+
+  deleteMaterial: async (id) => {
+    const { currentUser, materials, materialBorrowForms } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManageMaterial(currentUser)) return { success: false, error: '权限不足，仅督导可管理物资' };
+
+    const material = materials.find(m => m.id === id);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    const activeBorrows = materialBorrowForms.filter(
+      f => f.materialId === id && (f.status === 'borrowed' || f.status === 'pending')
+    );
+    if (activeBorrows.length > 0) {
+      return { success: false, error: '该物资存在未归还的借用单，无法删除' };
+    }
+
+    await db.deleteMaterial(id);
+
+    const syncItem = createMaterialSyncQueueItem(material, 'material', 'delete');
+    await db.addMaterialSyncQueueItem(syncItem);
+
+    const [updatedMaterials, updatedSyncQueue] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `物资「${material.name}」已删除`);
+    return { success: true };
+  },
+
+  addStockBatch: async (data) => {
+    const { currentUser, materials, materialBatches, materialRecords } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManageStock(currentUser)) return { success: false, error: '权限不足，仅督导可管理库存' };
+
+    const { materialId, storeId, quantity, batchNumber, remark, receivedDate } = data;
+    const material = materials.find(m => m.id === materialId);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    if (quantity <= 0) return { success: false, error: '入库数量必须大于0' };
+
+    const now = new Date().toISOString();
+    const newBatchNumber = batchNumber || generateBatchNumber();
+    const newReceivedDate = receivedDate || now;
+
+    const beforeStock = material.availableStock;
+    const afterStock = beforeStock + quantity;
+
+    const batch: MaterialStockBatch = {
+      id: generateId(),
+      materialId,
+      storeId,
+      batchNumber: newBatchNumber,
+      quantity,
+      receivedDate: newReceivedDate,
+      remark,
+      createdAt: now,
+      synced: false,
+    };
+
+    const record: MaterialRecord = {
+      id: generateId(),
+      materialId,
+      storeId,
+      type: 'restock',
+      quantity,
+      beforeStock,
+      afterStock,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      batchId: batch.id,
+      remark: remark || '库存入库',
+      timestamp: now,
+      synced: false,
+    };
+
+    const updatedMaterial: Material = {
+      ...material,
+      totalStock: material.totalStock + quantity,
+      availableStock: afterStock,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await Promise.all([
+      db.addMaterialBatch(batch),
+      db.addMaterialRecord(record),
+      db.putMaterial(updatedMaterial),
+    ]);
+
+    const syncItems = [
+      createMaterialSyncQueueItem(batch, 'material_batch', 'create'),
+      createMaterialSyncQueueItem(record, 'material_record', 'create'),
+      createMaterialSyncQueueItem(updatedMaterial, 'material', 'update'),
+    ];
+    for (const item of syncItems) {
+      await db.addMaterialSyncQueueItem(item);
+    }
+
+    const [
+      updatedMaterials, updatedBatches, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialBatches(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialBatches: updatedBatches,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `已入库 ${quantity} ${material.unit}「${material.name}」`);
+    return { success: true };
+  },
+
+  adjustStock: async (materialId, storeId, quantity, reason) => {
+    const { currentUser, materials, materialRecords } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canManageStock(currentUser)) return { success: false, error: '权限不足，仅督导可调整库存' };
+
+    const material = materials.find(m => m.id === materialId);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    if (quantity === 0) return { success: false, error: '调整数量不能为0' };
+    if (quantity < 0 && material.availableStock + quantity < 0) {
+      return { success: false, error: `库存不足，最多可调减 ${material.availableStock} ${material.unit}` };
+    }
+
+    const now = new Date().toISOString();
+    const beforeStock = material.availableStock;
+    const afterStock = beforeStock + quantity;
+    const recordType = quantity > 0 ? 'restock' : 'loss';
+
+    const record: MaterialRecord = {
+      id: generateId(),
+      materialId,
+      storeId,
+      type: recordType,
+      quantity: Math.abs(quantity),
+      beforeStock,
+      afterStock,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      remark: `库存调整：${quantity > 0 ? '增加' : '减少'} ${Math.abs(quantity)} ${material.unit}，原因：${reason}`,
+      timestamp: now,
+      synced: false,
+    };
+
+    const updatedMaterial: Material = {
+      ...material,
+      totalStock: material.totalStock + quantity,
+      availableStock: afterStock,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await Promise.all([
+      db.addMaterialRecord(record),
+      db.putMaterial(updatedMaterial),
+    ]);
+
+    const syncItems = [
+      createMaterialSyncQueueItem(record, 'material_record', 'create'),
+      createMaterialSyncQueueItem(updatedMaterial, 'material', 'update'),
+    ];
+    for (const item of syncItems) {
+      await db.addMaterialSyncQueueItem(item);
+    }
+
+    const [
+      updatedMaterials, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    const action = quantity > 0 ? '增加' : '减少';
+    get().addToast('success', `库存已${action} ${Math.abs(quantity)} ${material.unit}「${material.name}」`);
+    return { success: true };
+  },
+
+  validateBorrowConflicts: (materialId, storeId, borrowerId, quantity) => {
+    const { materials, materialBorrowForms, currentUser, stores } = get();
+    const conflicts: Array<{ type: string; message: string; options: string[] }> = [];
+
+    const material = materials.find(m => m.id === materialId);
+    if (!material) {
+      conflicts.push({
+        type: 'material_not_found',
+        message: '物资不存在',
+        options: ['请选择其他物资']
+      });
+      return conflicts;
+    }
+
+    if (material.availableStock < quantity) {
+      conflicts.push({
+        type: 'insufficient_stock',
+        message: `库存不足，当前可用库存为 ${material.availableStock} ${material.unit}，申请数量为 ${quantity} ${material.unit}`,
+        options: [
+          `减少申请数量至 ${material.availableStock} ${material.unit}`,
+          '联系督导补充库存',
+          '取消本次申请'
+        ]
+      });
+    }
+
+    if (currentUser && currentUser.role === 'manager' && currentUser.storeId !== storeId) {
+      const store = stores.find(s => s.id === storeId);
+      conflicts.push({
+        type: 'cross_store_borrow',
+        message: `您仅可为「${stores.find(s => s.id === currentUser.storeId)?.name || currentUser.storeId}」的人员申请借用，无法为「${store?.name || storeId}」申请`,
+        options: [
+          '请切换到对应门店身份',
+          '联系目标门店店长操作',
+          '取消本次申请'
+        ]
+      });
+    }
+
+    const activeBorrows = materialBorrowForms.filter(
+      f => f.materialId === materialId &&
+        f.storeId === storeId &&
+        f.borrowerId === borrowerId &&
+        (f.status === 'borrowed' || f.status === 'pending')
+    );
+
+    if (activeBorrows.length > 0) {
+      const totalBorrowed = activeBorrows.reduce((sum, f) => sum + f.quantity, 0);
+      conflicts.push({
+        type: 'duplicate_borrow',
+        message: `该用户已有 ${activeBorrows.length} 笔未归还的「${material.name}」，共计 ${totalBorrowed} ${material.unit}`,
+        options: [
+          '先归还已借物资后再申请',
+          '继续申请（合并处理）',
+          '取消本次申请'
+        ]
+      });
+    }
+
+    const pendingForms = materialBorrowForms.filter(
+      f => f.materialId === materialId &&
+        f.storeId === storeId &&
+        f.status === 'pending'
+    );
+
+    if (pendingForms.length > 0) {
+      const totalPending = pendingForms.reduce((sum, f) => sum + f.quantity, 0);
+      if (material.availableStock - totalPending < quantity) {
+        conflicts.push({
+          type: 'pending_reservation',
+          message: `另有 ${pendingForms.length} 笔待领取申请已预留 ${totalPending} ${material.unit}，扣除后剩余库存不足`,
+          options: [
+            `减少申请数量至 ${Math.max(0, material.availableStock - totalPending)} ${material.unit}`,
+            '等待其他申请处理完毕',
+            '联系督导确认库存',
+            '取消本次申请'
+          ]
+        });
+      }
+    }
+
+    return conflicts;
+  },
+
+  createBorrowForm: async (data) => {
+    const { currentUser } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canBorrowMaterial(currentUser, data.storeId)) return { success: false, error: '权限不足，无法申请借用' };
+
+    if (!data.materialId) return { success: false, error: '请选择物资' };
+    if (!data.storeId) return { success: false, error: '请选择门店' };
+    if (!data.borrowerId) return { success: false, error: '请选择借用人' };
+    if (data.quantity <= 0) return { success: false, error: '借用数量必须大于0' };
+
+    const conflicts = get().validateBorrowConflicts(
+      data.materialId,
+      data.storeId,
+      data.borrowerId,
+      data.quantity
+    );
+
+    if (conflicts.length > 0 && !data.status) {
+      return { success: false, error: '存在借用冲突', conflicts };
+    }
+
+    const now = new Date().toISOString();
+    const status: MaterialBorrowStatus = data.status || 'pending';
+
+    const baseForm = {
+      ...data,
+      id: generateId(),
+      formNumber: generateBorrowFormNumber(),
+      status,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      createdAt: now,
+      updatedAt: now,
+      synced: false,
+    };
+
+    const form = normalizeMaterialBorrowFormDefaults(baseForm as any);
+
+    await db.addMaterialBorrowForm(form);
+
+    if (status === 'borrowed') {
+      const { materials } = get();
+      const material = materials.find(m => m.id === data.materialId);
+      if (material) {
+        const beforeStock = material.availableStock;
+        const afterStock = beforeStock - data.quantity;
+
+        const record: MaterialRecord = {
+          id: generateId(),
+          materialId: data.materialId,
+          storeId: data.storeId,
+          formId: form.id,
+          type: 'borrow',
+          quantity: data.quantity,
+          beforeStock,
+          afterStock,
+          operatorId: currentUser.id,
+          operatorName: currentUser.name,
+          operatorRole: currentUser.role,
+          relatedUserId: data.borrowerId,
+          relatedUserName: data.borrowerName,
+          remark: data.purpose || '物资借出',
+          timestamp: now,
+          synced: false,
+        };
+
+        const updatedMaterial: Material = {
+          ...material,
+          availableStock: afterStock,
+          updatedAt: now,
+          synced: false,
+        };
+
+        await Promise.all([
+          db.addMaterialRecord(record),
+          db.putMaterial(updatedMaterial),
+        ]);
+
+        const recordSyncItem = createMaterialSyncQueueItem(record, 'material_record', 'create');
+        const materialSyncItem = createMaterialSyncQueueItem(updatedMaterial, 'material', 'update');
+        await db.addMaterialSyncQueueItem(recordSyncItem);
+        await db.addMaterialSyncQueueItem(materialSyncItem);
+      }
+    }
+
+    const formSyncItem = createMaterialSyncQueueItem(form, 'material_borrow', 'create');
+    await db.addMaterialSyncQueueItem(formSyncItem);
+
+    const [
+      updatedForms, updatedMaterials, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterials(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materialBorrowForms: updatedForms,
+      materials: updatedMaterials,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    const statusLabel = MATERIAL_BORROW_STATUS_LABELS[status];
+    get().addToast('success', `借用单已${statusLabel}`);
+    return { success: true, form };
+  },
+
+  updateBorrowForm: async (formId, updates) => {
+    const { currentUser, materialBorrowForms } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const form = materialBorrowForms.find(f => f.id === formId);
+    if (!form) return { success: false, error: '借用单不存在' };
+    if (form.status !== 'draft') return { success: false, error: '仅草稿状态的借用单可编辑' };
+    if (form.borrowerId !== currentUser.id) return { success: false, error: '仅创建人可编辑' };
+    if (!canBorrowMaterial(currentUser, form.storeId)) return { success: false, error: '权限不足' };
+
+    const now = new Date().toISOString();
+    const updatedForm: MaterialBorrowForm = {
+      ...form,
+      ...updates,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await db.putMaterialBorrowForm(updatedForm);
+
+    const syncItem = createMaterialSyncQueueItem(updatedForm, 'material_borrow', 'update');
+    await db.addMaterialSyncQueueItem(syncItem);
+
+    const updatedForms = await db.getAllMaterialBorrowForms();
+    set({ materialBorrowForms: updatedForms, materialSyncQueue: await db.getAllMaterialSyncQueue() });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', '借用单已更新');
+    return { success: true };
+  },
+
+  cancelBorrowForm: async (formId) => {
+    const { currentUser, materialBorrowForms } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const form = materialBorrowForms.find(f => f.id === formId);
+    if (!form) return { success: false, error: '借用单不存在' };
+    if (!['draft', 'pending'].includes(form.status)) return { success: false, error: '该状态不允许取消' };
+    if (form.borrowerId !== currentUser.id) return { success: false, error: '仅创建人可取消' };
+    if (!canBorrowMaterial(currentUser, form.storeId)) return { success: false, error: '权限不足' };
+
+    const now = new Date().toISOString();
+    const updatedForm: MaterialBorrowForm = {
+      ...form,
+      status: 'cancelled',
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await db.putMaterialBorrowForm(updatedForm);
+
+    const syncItem = createMaterialSyncQueueItem(updatedForm, 'material_borrow', 'update');
+    await db.addMaterialSyncQueueItem(syncItem);
+
+    const updatedForms = await db.getAllMaterialBorrowForms();
+    set({ materialBorrowForms: updatedForms, materialSyncQueue: await db.getAllMaterialSyncQueue() });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', '借用单已取消');
+    return { success: true };
+  },
+
+  submitBorrowForm: async (formId) => {
+    const { currentUser, materialBorrowForms, materials } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const form = materialBorrowForms.find(f => f.id === formId);
+    if (!form) return { success: false, error: '借用单不存在' };
+    if (form.status !== 'pending' && form.status !== 'draft') {
+      return { success: false, error: '该借用单状态不允许提交' };
+    }
+
+    if (!canBorrowMaterial(currentUser, form.storeId)) {
+      return { success: false, error: '权限不足，无法确认领取' };
+    }
+
+    const material = materials.find(m => m.id === form.materialId);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    const conflicts = get().validateBorrowConflicts(
+      form.materialId,
+      form.storeId,
+      form.borrowerId,
+      form.quantity
+    );
+
+    const stockConflict = conflicts.find(c => c.type === 'insufficient_stock' || c.type === 'pending_reservation');
+    if (stockConflict) {
+      return { success: false, error: stockConflict.message, conflicts };
+    }
+
+    const now = new Date().toISOString();
+    const beforeStock = material.availableStock;
+    const afterStock = beforeStock - form.quantity;
+
+    const updatedForm: MaterialBorrowForm = {
+      ...form,
+      status: 'borrowed',
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      updatedAt: now,
+      synced: false,
+    };
+
+    const record: MaterialRecord = {
+      id: generateId(),
+      materialId: form.materialId,
+      storeId: form.storeId,
+      formId: form.id,
+      type: 'borrow',
+      quantity: form.quantity,
+      beforeStock,
+      afterStock,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      relatedUserId: form.borrowerId,
+      relatedUserName: form.borrowerName,
+      remark: form.purpose || '物资借出',
+      timestamp: now,
+      synced: false,
+    };
+
+    const updatedMaterial: Material = {
+      ...material,
+      availableStock: afterStock,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await Promise.all([
+      db.putMaterialBorrowForm(updatedForm),
+      db.addMaterialRecord(record),
+      db.putMaterial(updatedMaterial),
+    ]);
+
+    const syncItems = [
+      createMaterialSyncQueueItem(updatedForm, 'material_borrow', 'update'),
+      createMaterialSyncQueueItem(record, 'material_record', 'create'),
+      createMaterialSyncQueueItem(updatedMaterial, 'material', 'update'),
+    ];
+    for (const item of syncItems) {
+      await db.addMaterialSyncQueueItem(item);
+    }
+
+    const [
+      updatedForms, updatedMaterials, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterials(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materialBorrowForms: updatedForms,
+      materials: updatedMaterials,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `已确认领取 ${form.quantity} ${material.unit}「${material.name}」`);
+    return { success: true };
+  },
+
+  returnBorrowForm: async function (formId: string, data?: any, lossQuantity?: number, lossReason?: string) {
+    const { currentUser, materialBorrowForms, materials, stores } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+
+    const form = materialBorrowForms.find(f => f.id === formId);
+    if (!form) return { success: false, error: '借用单不存在' };
+    if (form.status !== 'borrowed') {
+      return { success: false, error: '该借用单状态不允许归还' };
+    }
+
+    if (!canReturnMaterial(currentUser, form)) {
+      return { success: false, error: '权限不足，无法办理归还' };
+    }
+
+    if (currentUser.role === 'manager' && currentUser.storeId !== form.storeId) {
+      const formStore = stores.find(s => s.id === form.storeId);
+      const userStore = stores.find(s => s.id === currentUser.storeId);
+      return {
+        success: false,
+        error: `跨门店归还：该借用单属于「${formStore?.name || form.storeId}」，您仅可处理「${userStore?.name || currentUser.storeId}」的归还`,
+        conflicts: [{
+          type: 'cross_store_return',
+          message: `跨门店归还：该借用单属于「${formStore?.name || form.storeId}」，您仅可处理「${userStore?.name || currentUser.storeId}」的归还`,
+          options: ['请切换到对应门店身份', '联系目标门店店长操作', '取消本次归还']
+        }]
+      };
+    }
+
+    const material = materials.find(m => m.id === form.materialId);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    let handbackCondition: string | undefined;
+    let actualLossQuantity: number | undefined;
+    let actualLossReason: string | undefined;
+
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      handbackCondition = data.handbackCondition || data.remark;
+      actualLossQuantity = data.lossQuantity ?? (form.quantity - (data.quantity ?? form.quantity));
+      actualLossReason = data.lossReason;
+    } else {
+      handbackCondition = data as string | undefined;
+      actualLossQuantity = lossQuantity;
+      actualLossReason = lossReason;
+    }
+
+    const actualLoss = actualLossQuantity ?? 0;
+    if (actualLoss < 0 || actualLoss > form.quantity) {
+      return { success: false, error: '报损数量无效' };
+    }
+
+    const returnQuantity = form.quantity - actualLoss;
+    const now = new Date().toISOString();
+    const beforeStock = material.availableStock;
+    const afterStock = beforeStock + returnQuantity;
+
+    const updatedForm: MaterialBorrowForm = {
+      ...form,
+      status: actualLoss === form.quantity ? 'lost' : 'returned',
+      actualReturnDate: now,
+      handbackCondition,
+      lossQuantity: actualLoss,
+      lossReason: actualLoss > 0 ? actualLossReason : undefined,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      updatedAt: now,
+      synced: false,
+    };
+
+    const records: MaterialRecord[] = [];
+
+    if (returnQuantity > 0) {
+      records.push({
+        id: generateId(),
+        materialId: form.materialId,
+        storeId: form.storeId,
+        formId: form.id,
+        type: 'return',
+        quantity: returnQuantity,
+        beforeStock,
+        afterStock,
+        operatorId: currentUser.id,
+        operatorName: currentUser.name,
+        operatorRole: currentUser.role,
+        relatedUserId: form.borrowerId,
+        relatedUserName: form.borrowerName,
+        remark: handbackCondition || '物资归还',
+        timestamp: now,
+        synced: false,
+      });
+    }
+
+    if (actualLoss > 0) {
+      records.push({
+        id: generateId(),
+        materialId: form.materialId,
+        storeId: form.storeId,
+        formId: form.id,
+        type: 'loss',
+        quantity: actualLoss,
+        beforeStock: material.totalStock,
+        afterStock: material.totalStock - actualLoss,
+        operatorId: currentUser.id,
+        operatorName: currentUser.name,
+        operatorRole: currentUser.role,
+        relatedUserId: form.borrowerId,
+        relatedUserName: form.borrowerName,
+        remark: lossReason || '物资报损',
+        timestamp: now,
+        synced: false,
+      });
+    }
+
+    const updatedMaterial: Material = {
+      ...material,
+      availableStock: afterStock,
+      totalStock: material.totalStock - actualLoss,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await Promise.all([
+      db.putMaterialBorrowForm(updatedForm),
+      ...records.map(r => db.addMaterialRecord(r)),
+      db.putMaterial(updatedMaterial),
+    ]);
+
+    const syncItems = [
+      createMaterialSyncQueueItem(updatedForm, 'material_borrow', 'update'),
+      ...records.map(r => createMaterialSyncQueueItem(r, 'material_record', 'create')),
+      createMaterialSyncQueueItem(updatedMaterial, 'material', 'update'),
+    ];
+    for (const item of syncItems) {
+      await db.addMaterialSyncQueueItem(item);
+    }
+
+    const [
+      updatedForms, updatedMaterials, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterials(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materialBorrowForms: updatedForms,
+      materials: updatedMaterials,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    const statusText = actualLoss === form.quantity ? '已报损' : `已归还 ${returnQuantity} ${material.unit}`;
+    const lossText = actualLoss > 0 ? `，报损 ${actualLoss} ${material.unit}` : '';
+    get().addToast('success', `${statusText}${lossText}`);
+    return { success: true };
+  },
+
+  reportLoss: async (materialId, storeId, quantity, reason, operatorRemark) => {
+    const { currentUser, materials, materialRecords } = get();
+    if (!currentUser) return { success: false, error: '请先选择身份' };
+    if (!canReportLoss(currentUser)) return { success: false, error: '权限不足，仅督导可执行报损' };
+
+    const material = materials.find(m => m.id === materialId);
+    if (!material) return { success: false, error: '物资不存在' };
+
+    if (quantity <= 0) return { success: false, error: '报损数量必须大于0' };
+    if (quantity > material.availableStock) {
+      return { success: false, error: `报损数量不能超过可用库存（${material.availableStock} ${material.unit}）` };
+    }
+
+    const now = new Date().toISOString();
+    const beforeStock = material.availableStock;
+    const afterStock = beforeStock - quantity;
+
+    const record: MaterialRecord = {
+      id: generateId(),
+      materialId,
+      storeId,
+      type: 'loss',
+      quantity,
+      beforeStock,
+      afterStock,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      remark: `${reason || '物资报损'}${operatorRemark ? ` - ${operatorRemark}` : ''}`,
+      timestamp: now,
+      synced: false,
+    };
+
+    const updatedMaterial: Material = {
+      ...material,
+      availableStock: afterStock,
+      totalStock: material.totalStock - quantity,
+      updatedAt: now,
+      synced: false,
+    };
+
+    await Promise.all([
+      db.addMaterialRecord(record),
+      db.putMaterial(updatedMaterial),
+    ]);
+
+    const syncItems = [
+      createMaterialSyncQueueItem(record, 'material_record', 'create'),
+      createMaterialSyncQueueItem(updatedMaterial, 'material', 'update'),
+    ];
+    for (const item of syncItems) {
+      await db.addMaterialSyncQueueItem(item);
+    }
+
+    const [
+      updatedMaterials, updatedRecords, updatedSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials: updatedMaterials,
+      materialRecords: updatedRecords,
+      materialSyncQueue: updatedSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    get().addToast('success', `已报损 ${quantity} ${material.unit}「${material.name}」`);
+    return { success: true };
+  },
+
+  processMaterialSyncQueue: async (simulateConflict = false) => {
+    const { materialSyncQueue: currentQueue, isOnline } = get();
+    if (!isOnline) {
+      get().addToast('warning', '当前离线，无法同步');
+      return;
+    }
+
+    const pendingItems = currentQueue.filter(i => i.status === 'pending' || i.status === 'failed');
+
+    for (const item of pendingItems) {
+      await db.putMaterialSyncQueueItem({ ...item, status: 'syncing', lastAttempt: new Date().toISOString() });
+      set({ materialSyncQueue: await db.getAllMaterialSyncQueue() });
+
+      if (item.entityType === 'material' && item.payload) {
+        const result = await syncMaterialToServer(item.payload, simulateConflict && Math.random() > 0.7);
+        if (result.success) {
+          await db.putMaterial({ ...item.payload, synced: true });
+          await db.putMaterialSyncQueueItem({ ...item, status: 'completed' });
+        } else {
+          const errMsg = result.error || '物资同步失败';
+          await db.putMaterialSyncQueueItem({
+            ...item,
+            status: 'failed',
+            retryCount: item.retryCount + 1,
+            errorMessage: errMsg,
+          });
+        }
+      } else if (item.entityType === 'material_borrow' && item.payload) {
+        const result = await syncMaterialBorrowFormToServer(item.payload, simulateConflict && Math.random() > 0.7);
+        if (result.success) {
+          await db.putMaterialBorrowForm({ ...item.payload, synced: true });
+          await db.putMaterialSyncQueueItem({ ...item, status: 'completed' });
+        } else {
+          const errMsg = result.error || '借用单同步失败';
+          await db.putMaterialSyncQueueItem({
+            ...item,
+            status: 'failed',
+            retryCount: item.retryCount + 1,
+            errorMessage: errMsg,
+          });
+        }
+      } else {
+        await db.putMaterialSyncQueueItem({ ...item, status: 'completed' });
+      }
+    }
+
+    const [
+      materials, materialBorrowForms, materialRecords, materialSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials,
+      materialBorrowForms,
+      materialRecords,
+      materialSyncQueue,
+    });
+
+    const completedCount = materialSyncQueue.filter(i => i.status === 'completed').length;
+    const failedCount = materialSyncQueue.filter(i => i.status === 'failed').length;
+    if (completedCount > 0) {
+      get().addToast('success', `物资同步成功 ${completedCount} 项`);
+    }
+    if (failedCount > 0) {
+      get().addToast('error', `物资同步失败 ${failedCount} 项`);
+    }
+  },
+
+  retryMaterialSyncItem: async (itemId) => {
+    const item = get().materialSyncQueue.find(i => i.id === itemId);
+    if (!item) return;
+
+    await db.putMaterialSyncQueueItem({ ...item, status: 'pending', retryCount: 0 });
+    const materialSyncQueue = await db.getAllMaterialSyncQueue();
+    set({ materialSyncQueue });
+    get().processMaterialSyncQueue();
+  },
+
+  clearCompletedMaterialSync: async () => {
+    const { materialSyncQueue } = get();
+    const completed = materialSyncQueue.filter(i => i.status === 'completed');
+    for (const item of completed) {
+      await db.deleteMaterialSyncQueueItem(item.id);
+    }
+    const updatedQueue = await db.getAllMaterialSyncQueue();
+    set({ materialSyncQueue: updatedQueue });
+    get().addToast('info', `已清除 ${completed.length} 条已完成同步记录`);
+  },
+
+  saveDraftBorrowForm: (form) => {
+    const { currentUser } = get();
+    if (!currentUser) return;
+
+    const now = new Date().toISOString();
+    const draft: MaterialBorrowForm = normalizeMaterialBorrowFormDefaults({
+      ...form,
+      id: form.id || generateId(),
+      formNumber: form.formNumber || generateBorrowFormNumber(),
+      status: 'draft',
+      borrowerId: form.borrowerId || currentUser.id,
+      borrowerName: form.borrowerName || currentUser.name,
+      borrowerRole: form.borrowerRole || currentUser.role,
+      operatorId: currentUser.id,
+      operatorName: currentUser.name,
+      operatorRole: currentUser.role,
+      createdAt: form.createdAt || now,
+      updatedAt: now,
+      synced: false,
+    } as any);
+
+    set({ pendingMaterialBorrowForm: draft });
+    get().addToast('info', '草稿已保存');
+  },
+
+  clearDraftBorrowForm: () => {
+    set({ pendingMaterialBorrowForm: null });
+  },
+
+  saveMaterialDraft: (form) => {
+    get().saveDraftBorrowForm(form);
+    set({ currentMaterialDraft: get().pendingMaterialBorrowForm });
+  },
+
+  clearMaterialDraft: () => {
+    get().clearDraftBorrowForm();
+    set({ currentMaterialDraft: null });
+  },
+
+  importMaterialBackup: async (rawData) => {
+    const { currentUser, materials: existingMaterials, stores } = get();
+    if (!currentUser) return { success: false, warnings: [], errors: ['请先登录'] };
+    if (!canManageMaterial(currentUser)) {
+      return { success: false, warnings: [], errors: ['权限不足，仅督导可导入物资数据'] };
+    }
+
+    const validation = validateMaterialBackupImport(rawData, existingMaterials, currentUser);
+    set({ lastMaterialImportValidation: validation, materialImportWarnings: validation.warnings });
+
+    if (!validation.valid) {
+      for (const err of validation.errors) {
+        get().addToast('error', err);
+      }
+      return { success: false, warnings: validation.warnings, errors: validation.errors };
+    }
+
+    const now = new Date().toISOString();
+    const importedIds = new Set<string>();
+
+    for (const material of validation.materialsToImport) {
+      if (importedIds.has(material.id)) continue;
+      try {
+        await db.addMaterial(material);
+        importedIds.add(material.id);
+      } catch {
+        await db.putMaterial(material);
+      }
+      const syncItem = createMaterialSyncQueueItem(material, 'material', 'create');
+      await db.addMaterialSyncQueueItem(syncItem);
+    }
+
+    for (const batch of validation.batchesToImport) {
+      try {
+        await db.addMaterialBatch(batch);
+      } catch {
+        await db.putMaterialBatch(batch);
+      }
+      const syncItem = createMaterialSyncQueueItem(batch, 'material_batch', 'create');
+      await db.addMaterialSyncQueueItem(syncItem);
+    }
+
+    for (const form of validation.borrowFormsToImport) {
+      try {
+        await db.addMaterialBorrowForm(form);
+      } catch {
+        await db.putMaterialBorrowForm(form);
+      }
+      const syncItem = createMaterialSyncQueueItem(form, 'material_borrow', 'create');
+      await db.addMaterialSyncQueueItem(syncItem);
+    }
+
+    for (const record of validation.recordsToImport) {
+      try {
+        await db.addMaterialRecord(record);
+      } catch {
+        continue;
+      }
+      const syncItem = createMaterialSyncQueueItem(record, 'material_record', 'create');
+      await db.addMaterialSyncQueueItem(syncItem);
+    }
+
+    const [
+      materials, materialBatches, materialBorrowForms, materialRecords, materialSyncQueue
+    ] = await Promise.all([
+      db.getAllMaterials(),
+      db.getAllMaterialBatches(),
+      db.getAllMaterialBorrowForms(),
+      db.getAllMaterialRecords(),
+      db.getAllMaterialSyncQueue(),
+    ]);
+
+    set({
+      materials,
+      materialBatches,
+      materialBorrowForms,
+      materialRecords,
+      materialSyncQueue,
+    });
+
+    if (get().isOnline) {
+      get().processMaterialSyncQueue();
+    }
+
+    for (const warn of validation.warnings) {
+      get().addToast('warning', warn.message);
+    }
+
+    get().addToast('success',
+      `导入完成：${validation.materialsToImport.length} 条物资，` +
+      `${validation.batchesToImport.length} 条库存批次，` +
+      `${validation.borrowFormsToImport.length} 条借用单，` +
+      `${validation.recordsToImport.length} 条出入库记录`
+    );
+
+    return { success: true, warnings: validation.warnings, errors: [] };
+  },
+
+  exportMaterialBackup: () => {
+    const { currentUser, materials, materialBatches, materialBorrowForms, materialRecords, materialSyncQueue } = get();
+    if (!currentUser) return;
+    if (!canExportMaterial(currentUser)) {
+      get().addToast('error', '权限不足，仅督导可导出物资数据');
+      return;
+    }
+
+    const payload = buildMaterialExportPayload(
+      materials,
+      materialBatches,
+      materialBorrowForms,
+      materialRecords,
+      materialSyncQueue,
+      currentUser
+    );
+
+    const content = JSON.stringify(payload, null, 2);
+    const timestamp = new Date().toISOString().slice(0, 10);
+    downloadFile(content, `material-backup-${timestamp}.json`, 'application/json');
+
+    get().addToast('success',
+      `物资数据导出成功（${materials.length} 条物资，` +
+      `${materialBorrowForms.length} 条借用单，` +
+      `${materialRecords.length} 条出入库记录）`
+    );
+  },
+
+  getMaterialBorrowFormsForCurrentUser: () => {
+    const { materialBorrowForms, currentUser } = get();
+    if (!currentUser) return [];
+
+    if (currentUser.role === 'supervisor') return materialBorrowForms;
+
+    if (currentUser.role === 'manager') {
+      return materialBorrowForms.filter(f => f.storeId === currentUser.storeId);
+    }
+
+    return materialBorrowForms.filter(f => f.borrowerId === currentUser.id);
+  },
+
+  getMaterialBorrowFormsForStore: (storeId) => {
+    const { materialBorrowForms, currentUser, stores } = get();
+    if (!currentUser) return [];
+    if (!canViewMaterial(currentUser, storeId)) return [];
+
+    return materialBorrowForms.filter(f => f.storeId === storeId);
+  },
+
+  getMaterialOccupancyByStore: (storeId) => {
+    const { materialBorrowForms, materials, stores, currentUser } = get();
+    if (!currentUser || !canViewStoreOccupancy(currentUser, storeId)) return [];
+
+    const store = stores.find(s => s.id === storeId);
+    const occupancyMap = new Map<string, { materialId: string; materialName: string; materialCode: string; borrowedQuantity: number; storeId: string; storeName?: string }>();
+
+    const activeForms = materialBorrowForms.filter(
+      f => f.storeId === storeId && (f.status === 'borrowed' || f.status === 'pending')
+    );
+
+    for (const form of activeForms) {
+      const material = materials.find(m => m.id === form.materialId);
+      if (!material) continue;
+
+      const existing = occupancyMap.get(form.materialId);
+      if (existing) {
+        existing.borrowedQuantity += form.quantity;
+      } else {
+        occupancyMap.set(form.materialId, {
+          materialId: form.materialId,
+          materialName: material.name,
+          materialCode: material.code,
+          borrowedQuantity: form.quantity,
+          storeId,
+          storeName: store?.name,
+        });
+      }
+    }
+
+    return Array.from(occupancyMap.values());
   },
 }));

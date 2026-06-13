@@ -491,3 +491,139 @@ export interface HandoverPackage {
   handoverImportBatchId?: string;
   hasUndo?: boolean;
 }
+
+export type MaterialStatus = 'active' | 'inactive' | 'discontinued';
+export type MaterialRecordType = 'borrow' | 'return' | 'loss' | 'restock' | 'adjust';
+export type MaterialBorrowStatus = 'draft' | 'pending' | 'borrowed' | 'returned' | 'lost' | 'cancelled';
+
+export interface Material {
+  id: string;
+  code: string;
+  name: string;
+  category: string;
+  unit: string;
+  spec?: string;
+  description?: string;
+  status: MaterialStatus;
+  totalStock: number;
+  availableStock: number;
+  minStock?: number;
+  createdAt: string;
+  updatedAt: string;
+  synced: boolean;
+}
+
+export interface MaterialStockBatch {
+  id: string;
+  materialId: string;
+  storeId: string;
+  batchNumber: string;
+  quantity: number;
+  receivedDate: string;
+  expiryDate?: string;
+  remark?: string;
+  createdAt: string;
+  synced: boolean;
+}
+
+export interface MaterialBorrowForm {
+  id: string;
+  formNumber: string;
+  materialId: string;
+  storeId: string;
+  quantity: number;
+  borrowerId: string;
+  borrowerName?: string;
+  borrowerRole?: UserRole;
+  expectedReturnDate?: string;
+  actualReturnDate?: string;
+  purpose?: string;
+  status: MaterialBorrowStatus;
+  handbackCondition?: string;
+  lossReason?: string;
+  lossQuantity?: number;
+  operatorId?: string;
+  operatorName?: string;
+  operatorRole?: UserRole;
+  createdAt: string;
+  updatedAt: string;
+  synced: boolean;
+  lastSyncError?: string;
+}
+
+export interface MaterialRecord {
+  id: string;
+  materialId: string;
+  storeId: string;
+  formId?: string;
+  type: MaterialRecordType;
+  quantity: number;
+  beforeStock: number;
+  afterStock: number;
+  operatorId: string;
+  operatorName?: string;
+  operatorRole?: UserRole;
+  relatedUserId?: string;
+  relatedUserName?: string;
+  batchId?: string;
+  remark?: string;
+  timestamp: string;
+  synced: boolean;
+}
+
+export interface MaterialSyncQueueItem {
+  id: string;
+  entityType: 'material' | 'material_batch' | 'material_borrow' | 'material_record';
+  entityId: string;
+  action: SyncAction;
+  status: SyncStatus;
+  retryCount: number;
+  lastAttempt?: string;
+  errorMessage?: string;
+  payload: any;
+}
+
+export type MaterialBackupWarningType =
+  | 'material_missing_code'
+  | 'material_missing_store'
+  | 'material_missing_operator'
+  | 'material_missing_batch'
+  | 'material_invalid_quantity'
+  | 'material_missing_abnormal'
+  | 'material_unknown_category';
+
+export interface MaterialBackupWarning {
+  type: MaterialBackupWarningType;
+  materialId?: string;
+  materialCode?: string;
+  materialName?: string;
+  formId?: string;
+  message: string;
+  missingFields?: string[];
+  appliedDefaults?: Record<string, any>;
+}
+
+export interface MaterialImportValidationResult {
+  valid: boolean;
+  warnings: MaterialBackupWarning[];
+  errors: string[];
+  materialsToImport: Material[];
+  batchesToImport: MaterialStockBatch[];
+  borrowFormsToImport: MaterialBorrowForm[];
+  recordsToImport: MaterialRecord[];
+}
+
+export interface MaterialExportPayload {
+  materials: Material[];
+  materialBatches: MaterialStockBatch[];
+  materialBorrowForms: MaterialBorrowForm[];
+  materialRecords: MaterialRecord[];
+  materialSyncQueue: MaterialSyncQueueItem[];
+  exportedAt: string;
+  exportedBy?: {
+    id: string;
+    role: UserRole;
+    name: string;
+  };
+  schemaVersion: string;
+}

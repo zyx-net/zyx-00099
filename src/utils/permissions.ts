@@ -1,4 +1,4 @@
-import { UserRole, User, Issue, ReviewPlan, HandoverImportBatch, HandoverImportPrecheckResult } from '@/types';
+import { UserRole, User, Issue, ReviewPlan, HandoverImportBatch, HandoverImportPrecheckResult, MaterialBorrowForm } from '@/types';
 
 export const PERMISSIONS: Record<UserRole, string[]> = {
   inspector: [
@@ -9,6 +9,10 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'history:view',
     'plan:view_own',
     'plan:delay_request_own',
+    'material:view',
+    'material:borrow_own',
+    'material:return_own',
+    'material:view_own_borrow',
   ],
   manager: [
     'issue:view_all',
@@ -24,6 +28,11 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'handover:precheck_view_store',
     'plan:delay_request_store',
     'plan:delay_approve_store',
+    'material:view',
+    'material:view_store_occupancy',
+    'material:view_store_borrow',
+    'material:borrow_store',
+    'material:return_store',
   ],
   supervisor: [
     'issue:view_all',
@@ -47,6 +56,13 @@ export const PERMISSIONS: Record<UserRole, string[]> = {
     'plan:delay_request_all',
     'plan:delay_approve_all',
     'plan:time_conflict_resolve_all',
+    'material:view_all',
+    'material:manage',
+    'material:stock_manage',
+    'material:loss_report',
+    'material:borrow_all',
+    'material:return_all',
+    'material:export',
   ]
 };
 
@@ -62,9 +78,9 @@ export const ROLE_LABELS: Record<UserRole, string> = {
 };
 
 export const ROLE_DESCRIPTIONS: Record<UserRole, string> = {
-  inspector: '创建并提交巡检问题，查看分配给自己的复查计划',
-  manager: '查看门店问题，核实后关闭问题，安排复查整改计划，导出记录',
-  supervisor: '导入配置，升级模板，驳回问题，解决冲突，管理同步，全局安排复查计划'
+  inspector: '创建并提交巡检问题，查看分配给自己的复查计划，领取和归还巡检物资',
+  manager: '查看门店问题，核实后关闭问题，安排复查整改计划，导出记录，查看本门店物资占用情况',
+  supervisor: '导入配置，升级模板，驳回问题，解决冲突，管理同步，全局安排复查计划，维护物资目录和库存'
 };
 
 export function canManageIssue(user: User | null | undefined, issue: Issue | undefined, action: 'close' | 'reject'): boolean {
@@ -211,4 +227,63 @@ export function canPrecheckHandoverImport(
   return hasPermission(user.role, 'handover:import') 
     || hasPermission(user.role, 'handover:precheck_view_all')
     || hasPermission(user.role, 'handover:precheck_view_store');
+}
+
+export function canManageMaterial(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'material:manage');
+}
+
+export function canManageStock(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'material:stock_manage');
+}
+
+export function canReportLoss(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'material:loss_report');
+}
+
+export function canViewMaterial(user: User | null | undefined, storeId?: string): boolean {
+  if (!user) return false;
+  if (hasPermission(user.role, 'material:view_all')) return true;
+  if (hasPermission(user.role, 'material:view')) {
+    if (!storeId) return true;
+    if (user.role === 'manager') return user.storeId === storeId;
+    return true;
+  }
+  return false;
+}
+
+export function canBorrowMaterial(user: User | null | undefined, storeId?: string): boolean {
+  if (!user) return false;
+  if (hasPermission(user.role, 'material:borrow_all')) return true;
+  if (hasPermission(user.role, 'material:borrow_store')) {
+    if (!storeId) return true;
+    return user.storeId === storeId;
+  }
+  if (hasPermission(user.role, 'material:borrow_own')) return true;
+  return false;
+}
+
+export function canReturnMaterial(user: User | null | undefined, form?: MaterialBorrowForm): boolean {
+  if (!user) return false;
+  if (hasPermission(user.role, 'material:return_all')) return true;
+  if (hasPermission(user.role, 'material:return_store')) {
+    if (!form) return true;
+    return user.storeId === form.storeId;
+  }
+  if (hasPermission(user.role, 'material:return_own')) {
+    if (!form) return true;
+    return user.id === form.borrowerId;
+  }
+  return false;
+}
+
+export function canViewStoreOccupancy(user: User | null | undefined, storeId?: string): boolean {
+  if (!user) return false;
+  if (!hasPermission(user.role, 'material:view_store_occupancy')) return false;
+  if (!storeId) return true;
+  return user.storeId === storeId;
+}
+
+export function canExportMaterial(user: User | null | undefined): boolean {
+  return hasPermission(user?.role, 'material:export');
 }

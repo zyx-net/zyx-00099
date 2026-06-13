@@ -1,12 +1,13 @@
 import { openDB, IDBPDatabase } from 'idb';
 import {
   Issue, Store, Template, History, Conflict, SyncQueueItem, User, MigrationRecord,
-  ReviewPlan, PlanConflict, PlanDelayRecord, HandoverImportBatch, HandoverImportPrecheckResult
+  ReviewPlan, PlanConflict, PlanDelayRecord, HandoverImportBatch, HandoverImportPrecheckResult,
+  Material, MaterialStockBatch, MaterialBorrowForm, MaterialRecord, MaterialSyncQueueItem
 } from '@/types';
 import { normalizeReviewPlanDefaults } from '@/utils/helpers';
 
 const DB_NAME = 'inspection-pwa-db';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 export interface DBSchema {
   users: { key: string; value: User };
@@ -22,6 +23,11 @@ export interface DBSchema {
   planDelayRecords: { key: string; value: PlanDelayRecord; indexes: { 'by-plan': string; 'by-issue': string; 'by-status': string; 'by-requester': string; 'by-approver': string } };
   handoverImportBatches: { key: string; value: HandoverImportBatch; indexes: { 'by-status': string; 'by-creator': string; 'by-created-at': string } };
   handoverPrecheckResults: { key: string; value: HandoverImportPrecheckResult; indexes: { 'by-batch': string; 'by-creator': string } };
+  materials: { key: string; value: Material; indexes: { 'by-code': string; 'by-category': string; 'by-status': string } };
+  materialBatches: { key: string; value: MaterialStockBatch; indexes: { 'by-material': string; 'by-store': string; 'by-batch': string } };
+  materialBorrowForms: { key: string; value: MaterialBorrowForm; indexes: { 'by-material': string; 'by-store': string; 'by-borrower': string; 'by-status': string } };
+  materialRecords: { key: string; value: MaterialRecord; indexes: { 'by-material': string; 'by-store': string; 'by-form': string; 'by-operator': string; 'by-timestamp': string } };
+  materialSyncQueue: { key: string; value: MaterialSyncQueueItem; indexes: { 'by-status': string; 'by-entity': string } };
 }
 
 let db: IDBPDatabase<DBSchema> | null = null;
@@ -145,6 +151,40 @@ export async function initDB(): Promise<IDBPDatabase<DBSchema>> {
           const hpStore = db.createObjectStore('handoverPrecheckResults', { keyPath: 'id' });
           hpStore.createIndex('by-batch', 'batchId');
           hpStore.createIndex('by-creator', 'createdBy');
+        }
+      }
+      if (oldVersion < 6) {
+        if (!db.objectStoreNames.contains('materials')) {
+          const matStore = db.createObjectStore('materials', { keyPath: 'id' });
+          matStore.createIndex('by-code', 'code');
+          matStore.createIndex('by-category', 'category');
+          matStore.createIndex('by-status', 'status');
+        }
+        if (!db.objectStoreNames.contains('materialBatches')) {
+          const mbStore = db.createObjectStore('materialBatches', { keyPath: 'id' });
+          mbStore.createIndex('by-material', 'materialId');
+          mbStore.createIndex('by-store', 'storeId');
+          mbStore.createIndex('by-batch', 'batchNumber');
+        }
+        if (!db.objectStoreNames.contains('materialBorrowForms')) {
+          const mbfStore = db.createObjectStore('materialBorrowForms', { keyPath: 'id' });
+          mbfStore.createIndex('by-material', 'materialId');
+          mbfStore.createIndex('by-store', 'storeId');
+          mbfStore.createIndex('by-borrower', 'borrowerId');
+          mbfStore.createIndex('by-status', 'status');
+        }
+        if (!db.objectStoreNames.contains('materialRecords')) {
+          const mrStore = db.createObjectStore('materialRecords', { keyPath: 'id' });
+          mrStore.createIndex('by-material', 'materialId');
+          mrStore.createIndex('by-store', 'storeId');
+          mrStore.createIndex('by-form', 'formId');
+          mrStore.createIndex('by-operator', 'operatorId');
+          mrStore.createIndex('by-timestamp', 'timestamp');
+        }
+        if (!db.objectStoreNames.contains('materialSyncQueue')) {
+          const msqStore = db.createObjectStore('materialSyncQueue', { keyPath: 'id' });
+          msqStore.createIndex('by-status', 'status');
+          msqStore.createIndex('by-entity', 'entityType');
         }
       }
     },
@@ -429,7 +469,7 @@ export async function updatePlanDelayRecord(record: PlanDelayRecord): Promise<st
 export async function clearAllData(): Promise<void> {
   const database = await initDB();
   const tx = database.transaction(
-    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords', 'handoverImportBatches', 'handoverPrecheckResults'],
+    ['stores', 'templates', 'issues', 'histories', 'conflicts', 'syncQueue', 'migrations', 'reviewPlans', 'planConflicts', 'planDelayRecords', 'handoverImportBatches', 'handoverPrecheckResults', 'materials', 'materialBatches', 'materialBorrowForms', 'materialRecords', 'materialSyncQueue'],
     'readwrite'
   );
   await Promise.all([
@@ -445,6 +485,11 @@ export async function clearAllData(): Promise<void> {
     tx.objectStore('planDelayRecords').clear(),
     tx.objectStore('handoverImportBatches').clear(),
     tx.objectStore('handoverPrecheckResults').clear(),
+    tx.objectStore('materials').clear(),
+    tx.objectStore('materialBatches').clear(),
+    tx.objectStore('materialBorrowForms').clear(),
+    tx.objectStore('materialRecords').clear(),
+    tx.objectStore('materialSyncQueue').clear(),
     tx.done,
   ]);
 }
@@ -499,4 +544,160 @@ export async function addHandoverPrecheckResult(result: HandoverImportPrecheckRe
 export async function updateHandoverPrecheckResult(result: HandoverImportPrecheckResult): Promise<string> {
   const database = await initDB();
   return database.put('handoverPrecheckResults', result) as Promise<string>;
+}
+
+export async function getAllMaterials(): Promise<Material[]> {
+  const database = await initDB();
+  return database.getAll('materials');
+}
+
+export async function getMaterialById(id: string): Promise<Material | undefined> {
+  const database = await initDB();
+  return database.get('materials', id);
+}
+
+export async function getMaterialsByCode(code: string): Promise<Material[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materials', 'by-code', code);
+}
+
+export async function addMaterial(material: Material): Promise<string> {
+  const database = await initDB();
+  return database.add('materials', material) as Promise<string>;
+}
+
+export async function putMaterial(material: Material): Promise<string> {
+  const database = await initDB();
+  return database.put('materials', material) as Promise<string>;
+}
+
+export async function deleteMaterial(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('materials', id);
+}
+
+export async function getAllMaterialBatches(): Promise<MaterialStockBatch[]> {
+  const database = await initDB();
+  return database.getAll('materialBatches');
+}
+
+export async function getMaterialBatchesByMaterial(materialId: string): Promise<MaterialStockBatch[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBatches', 'by-material', materialId);
+}
+
+export async function getMaterialBatchesByStore(storeId: string): Promise<MaterialStockBatch[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBatches', 'by-store', storeId);
+}
+
+export async function addMaterialBatch(batch: MaterialStockBatch): Promise<string> {
+  const database = await initDB();
+  return database.add('materialBatches', batch) as Promise<string>;
+}
+
+export async function putMaterialBatch(batch: MaterialStockBatch): Promise<string> {
+  const database = await initDB();
+  return database.put('materialBatches', batch) as Promise<string>;
+}
+
+export async function getAllMaterialBorrowForms(): Promise<MaterialBorrowForm[]> {
+  const database = await initDB();
+  return database.getAll('materialBorrowForms');
+}
+
+export async function getMaterialBorrowFormsByMaterial(materialId: string): Promise<MaterialBorrowForm[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBorrowForms', 'by-material', materialId);
+}
+
+export async function getMaterialBorrowFormsByStore(storeId: string): Promise<MaterialBorrowForm[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBorrowForms', 'by-store', storeId);
+}
+
+export async function getMaterialBorrowFormsByBorrower(borrowerId: string): Promise<MaterialBorrowForm[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBorrowForms', 'by-borrower', borrowerId);
+}
+
+export async function getMaterialBorrowFormsByStatus(status: string): Promise<MaterialBorrowForm[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialBorrowForms', 'by-status', status);
+}
+
+export async function getMaterialBorrowFormById(id: string): Promise<MaterialBorrowForm | undefined> {
+  const database = await initDB();
+  return database.get('materialBorrowForms', id);
+}
+
+export async function addMaterialBorrowForm(form: MaterialBorrowForm): Promise<string> {
+  const database = await initDB();
+  return database.add('materialBorrowForms', form) as Promise<string>;
+}
+
+export async function putMaterialBorrowForm(form: MaterialBorrowForm): Promise<string> {
+  const database = await initDB();
+  return database.put('materialBorrowForms', form) as Promise<string>;
+}
+
+export async function deleteMaterialBorrowForm(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('materialBorrowForms', id);
+}
+
+export async function getAllMaterialRecords(): Promise<MaterialRecord[]> {
+  const database = await initDB();
+  return database.getAll('materialRecords');
+}
+
+export async function getMaterialRecordsByMaterial(materialId: string): Promise<MaterialRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialRecords', 'by-material', materialId);
+}
+
+export async function getMaterialRecordsByStore(storeId: string): Promise<MaterialRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialRecords', 'by-store', storeId);
+}
+
+export async function getMaterialRecordsByForm(formId: string): Promise<MaterialRecord[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialRecords', 'by-form', formId);
+}
+
+export async function addMaterialRecord(record: MaterialRecord): Promise<string> {
+  const database = await initDB();
+  return database.add('materialRecords', record) as Promise<string>;
+}
+
+export async function addMaterialRecords(records: MaterialRecord[]): Promise<void> {
+  const database = await initDB();
+  const tx = database.transaction('materialRecords', 'readwrite');
+  await Promise.all([...records.map(r => tx.store.add(r)), tx.done]);
+}
+
+export async function getAllMaterialSyncQueue(): Promise<MaterialSyncQueueItem[]> {
+  const database = await initDB();
+  return database.getAll('materialSyncQueue');
+}
+
+export async function getMaterialSyncQueueByStatus(status: string): Promise<MaterialSyncQueueItem[]> {
+  const database = await initDB();
+  return database.getAllFromIndex('materialSyncQueue', 'by-status', status);
+}
+
+export async function addMaterialSyncQueueItem(item: MaterialSyncQueueItem): Promise<string> {
+  const database = await initDB();
+  return database.add('materialSyncQueue', item) as Promise<string>;
+}
+
+export async function putMaterialSyncQueueItem(item: MaterialSyncQueueItem): Promise<string> {
+  const database = await initDB();
+  return database.put('materialSyncQueue', item) as Promise<string>;
+}
+
+export async function deleteMaterialSyncQueueItem(id: string): Promise<void> {
+  const database = await initDB();
+  await database.delete('materialSyncQueue', id);
 }

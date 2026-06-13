@@ -13,6 +13,7 @@ import History from '@/pages/History';
 import ConfigImport from '@/pages/ConfigImport';
 import Export from '@/pages/Export';
 import HandoverPrecheck from '@/pages/HandoverPrecheck';
+import MaterialLedger from '@/pages/MaterialLedger';
 
 function ProtectedRoute({ children, permission }: { children: React.ReactNode; permission?: string }) {
   const { currentUser } = useAppStore();
@@ -118,6 +119,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <HandoverPrecheck />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/materials"
+          element={
+            <ProtectedRoute permission="material:view">
+              <MaterialLedger />
             </ProtectedRoute>
           }
         />
